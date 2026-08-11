@@ -12,8 +12,15 @@ game (guest WASAPI) → winedirectaudio.drv → in-process mixer → AAudio → 
 ## Status
 Device-proven **v1** (arm64ec / bionic). Opt-in; pulse/alsa remain the recommended defaults. Output: 48 kHz · float · stereo.
 
-## License
-**LGPL-2.1-or-later** (see [`COPYING`](COPYING)). This is not a relicensing choice — the driver derives from and links Wine's LGPL `mmdevapi` internals (`wine/unixlib.h`, `../mmdevapi/unixlib.h`) and is modelled on `winecoreaudio.drv`, so it must remain LGPL. See [`AUTHORS`](AUTHORS) for provenance.
+## License & attribution
+**LGPL-2.1-or-later** (see [`COPYING`](COPYING)). This is not a relicensing choice — the driver derives from and links Wine's LGPL `mmdevapi` internals (`wine/unixlib.h`, `../mmdevapi/unixlib.h`) and is modelled on `winecoreaudio.drv`, so it must remain LGPL.
+
+**Copyright © 2026 The412Banner.** If you copy, modify, use, or distribute this code or any part of it, LGPL-2.1 **requires** you to:
+- **keep the copyright notice** in [`directaudio.c`](directaudio.c) intact in every copy and derivative,
+- **include the LGPL-2.1 license** ([`COPYING`](COPYING)) with any distribution,
+- **make the library source available** and **state your changes** (with dates).
+
+**Requested (courtesy):** projects that ship DirectAudio, in whole or part, are asked to credit it as *"DirectAudio by The412Banner (https://github.com/The412Banner/directaudio)"* in their docs, About screen, or release notes. See [`NOTICE`](NOTICE) and [`AUTHORS`](AUTHORS).
 
 ## This repo is a Wine DLL directory
 It is **not** a standalone buildable project — a Wine driver is a PE + unixlib pair compiled by Wine's own build system against private Wine headers, and its unixlib ABI is pinned to a specific Wine base. This repo is consumed as a **git submodule** dropped in at `dlls/winedirectaudio.drv/` of a Wine/Proton tree.

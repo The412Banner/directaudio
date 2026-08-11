@@ -9,6 +9,8 @@
  * winecoreaudio.drv (single native backend, render callback ~ AAudio callback);
  * the CoreAudio device layer is replaced with AAudio.
  *
+ * Copyright (C) 2026 The412Banner <205237651+The412Banner@users.noreply.github.com>
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
