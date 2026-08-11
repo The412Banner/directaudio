@@ -37,6 +37,7 @@
 #include <pthread.h>
 
 #include <aaudio/AAudio.h>
+#include <android/log.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -54,6 +55,12 @@
 #include "../mmdevapi/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(directaudio);
+
+/* Latency instrumentation — logs straight to Android logcat (tag "DirectAudio"),
+ * independent of WINEDEBUG and safe on the RT callback thread (pure Android call,
+ * no Wine TEB needed). Read on device with:  logcat -s DirectAudio:I
+ * latency_ms = frames / sample_rate * 1000. */
+#define DA_LOG(...) __android_log_print(ANDROID_LOG_INFO, "DirectAudio", __VA_ARGS__)
 
 struct directaudio_stream
 {
@@ -395,10 +402,17 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         }
     }
 
-    if (TRACE_ON(directaudio) && !(++mx->cb_count % 1000))
-        TRACE("mix hb: cb=%u voices=%d buf=%d cap=%d xruns=%d\n", mx->cb_count, mx->nvoices,
-              AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
-              AAudioStream_getXRunCount(aq));
+    /* Heartbeat to logcat every ~1000 callbacks (~a few seconds) — reports the
+     * EFFECTIVE buffer under load, which is the real in-game latency once the
+     * adaptive path has grown it on xruns. */
+    if (!(++mx->cb_count % 1000))
+    {
+        int32_t rate  = AAudioStream_getSampleRate(aq);
+        int32_t bufsz = AAudioStream_getBufferSizeInFrames(aq);
+        DA_LOG("hb: cb=%u voices=%d buf=%d(%.2fms) cap=%d xruns=%d", mx->cb_count, mx->nvoices,
+               bufsz, rate > 0 ? bufsz * 1000.0 / rate : 0.0,
+               AAudioStream_getBufferCapacityInFrames(aq), AAudioStream_getXRunCount(aq));
+    }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -480,6 +494,19 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     TRACE("mixer open: 48000/float/2ch perf=%d burst=%d buf=%d cap=%d\n", mx->perf,
           AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferSizeInFrames(aq),
           AAudioStream_getBufferCapacityInFrames(aq));
+
+    {
+        int32_t rate  = AAudioStream_getSampleRate(aq);
+        int32_t burst = AAudioStream_getFramesPerBurst(aq);
+        int32_t bufsz = AAudioStream_getBufferSizeInFrames(aq);
+        int32_t cap   = AAudioStream_getBufferCapacityInFrames(aq);
+        int      got  = (int)AAudioStream_getPerformanceMode(aq);
+        double   ms   = rate > 0 ? 1000.0 / rate : 0.0;
+        /* perf_got == 12 (LOW_LATENCY) confirms the fast/MMAP path was granted.
+         * buf_ms is the effective output latency at open. */
+        DA_LOG("open: perf_req=%d perf_got=%d rate=%d burst=%d(%.2fms) buf=%d(%.2fms) cap=%d(%.2fms)",
+               mx->perf, got, rate, burst, burst * ms, bufsz, bufsz * ms, cap, cap * ms);
+    }
 
     *out = aq;
     return AAUDIO_OK;
