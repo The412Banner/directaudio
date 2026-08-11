@@ -2,6 +2,8 @@
 
 **Native Wine → Android AAudio audio driver.** A Wine [`mmdevapi`](https://gitlab.winehq.org/wine/wine/-/tree/master/dlls/mmdevapi) backend (`winedirectaudio.drv`) that carries guest **WASAPI** audio straight to Android **AAudio** — **no PulseAudio daemon and no ALSA server** in the path. All per-stream mixing happens **in-process, inside the driver**, so there's one fewer process and one fewer IPC hop before Android's own mixer (AudioFlinger), which every app goes through anyway.
 
+![Pulse vs ALSA vs DirectAudio — how guest audio reaches the Android speaker](docs/audio-paths.jpg)
+
 ```
 game (guest WASAPI) → winedirectaudio.drv → in-process mixer → AAudio → AudioFlinger → 🔊
                                             (sum voices, mono/5.1/7.1 → stereo, resample → 48 kHz)
