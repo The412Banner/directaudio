@@ -136,15 +136,17 @@ jobs:
           # CROSSCFLAGS/PATH/DLLTOOL/…) persists into this shell for the targeted
           # make below. The script also applies the bionic + GE patches + configures.
           source build-scripts/build-step-arm64ec.sh ${{ matrix.page_flag }} --configure
-          echo "::group::make driver (explicit file targets — the dir target is a no-op)"
-          make -j"$(nproc)" \
-            dlls/winedirectaudio.drv/winedirectaudio.drv \
-            dlls/winedirectaudio.drv/winedirectaudio.so
+          # Discover the exact build targets from the generated Makefile. PE files
+          # live in an arch-prefixed subdir (e.g. arm64ec-windows/); the unixlib .so
+          # sits at the module-dir root. (make on the bare dir name is a no-op.)
+          mapfile -t TGTS < <(grep -oE "dlls/winedirectaudio\.drv/([A-Za-z0-9_-]+/)?winedirectaudio\.(drv|so)" Makefile | sort -u)
+          echo "discovered targets:"; printf '  %s\n' "${TGTS[@]}"
+          test "${#TGTS[@]}" -ge 2   # expect at least the PE + the unixlib
+          echo "::group::make driver"
+          make -j"$(nproc)" "${TGTS[@]}"
           echo "::endgroup::"
-          echo "=== driver dir after build ==="
-          ls -la dlls/winedirectaudio.drv/ || true
-          echo "=== any winedirectaudio.* build products ==="
-          find . -name 'winedirectaudio.*' ! -name '*.c' 2>/dev/null | head
+          echo "=== driver build products ==="
+          find dlls/winedirectaudio.drv -name 'winedirectaudio.*' ! -name '*.c' -exec ls -la {} +
 
       - name: Collect + strip artifacts
         working-directory: wine
