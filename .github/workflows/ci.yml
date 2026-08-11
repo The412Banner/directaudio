@@ -123,6 +123,10 @@ jobs:
           restore-keys: |
             ccache-da-${{ matrix.label }}-
 
+      - name: Build sysvshm (satisfies configure's --with-xshm requirement)
+        working-directory: wine
+        run: bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+
       - name: Configure + build ONLY the DirectAudio driver
         working-directory: wine
         shell: bash
