@@ -1,59 +1,194 @@
-name: build (compile-check against pinned Wine base)
+name: build driver (arm64ec hot-swap artifacts)
 
-# A Wine driver can't build standalone — it needs the Wine tree + toolchain.
-# This job overlays the PR's driver source onto a pinned proton-wine checkout
-# and builds ONLY dlls/winedirectaudio.drv, to prove it compiles and links the
-# mmdevapi unixlib ABI. On-device audio is verified separately (no device in CI).
+# Builds ONLY dlls/winedirectaudio.drv against a pinned proton-wine (Wine 11.0)
+# tree, reusing that repo's exact bionic/arm64ec toolchain (NDK r27d + bylaws
+# llvm-mingw). Produces the hot-swap pair the device Proton layer wants:
+#   winedirectaudio.drv  (arm64ec PE)   +   winedirectaudio.so  (unixlib)
+# for both 4KB (SDK28) and 16KB (SDK35) page devices. On a directaudio-v* tag
+# it attaches them to a GitHub release. On-device audio is verified separately.
 
 on:
   push:
     branches: [ main ]
+    tags: [ 'directaudio-v*' ]
   pull_request:
   workflow_dispatch:
 
-# The Wine base this driver revision is ABI-matched to. Bump when re-pinning.
+# Wine base this driver revision is ABI-matched to (mmdevapi unixlib vtable).
 env:
   PROTON_REPO: The412Banner/proton-wine
   PROTON_REF:  ge-proton11-5-bionic-staging   # Wine 11.0 base
 
 jobs:
-  compile-check:
-    runs-on: ubuntu-latest
-    # Reuse the same arm64ec/bionic build image proton-wine's own workflow uses.
-    # container: ghcr.io/the412banner/proton-bionic-arm64ec:latest   # <-- wire to your existing image
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: arm64ec-sdk28   # 4KB-page devices
+            page_flag: ""
+          - label: arm64ec-sdk35   # 16KB-page devices
+            page_flag: "--enable-16kb-pages"
     steps:
-      - name: Checkout pinned Wine base
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h | head -2
+
+      - name: Checkout pinned Wine tree (proton-wine)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PROTON_REPO }}
           ref: ${{ env.PROTON_REF }}
           path: wine
-          fetch-depth: 1
+          submodules: recursive
 
-      - name: Overlay this PR's driver into the Wine tree
+      - name: Checkout this driver (source under test)
         uses: actions/checkout@v4
         with:
           path: driver
 
-      - name: Place driver + integration deltas
+      - name: Overlay driver source into the Wine tree
         run: |
           set -e
-          cp driver/directaudio.c driver/Makefile.in wine/dlls/winedirectaudio.drv/
-          # The two host-tree deltas normally carried by the consumer; the pinned
-          # base above already contains them, so nothing to patch here. If testing
-          # against a clean upstream Wine, apply INTEGRATION.md first.
+          cp -v driver/directaudio.c driver/Makefile.in wine/dlls/winedirectaudio.drv/
+          # Integration deltas (configure.ac + mmdevapi default_list) already live in
+          # the pinned proton-wine ref; nothing to patch here.
 
-      - name: Configure + build only the DirectAudio driver
-        working-directory: wine
+      - name: Set up build environment
         run: |
-          set -e
-          ./tools/make_requests || true
-          # Toolchain flags (arm64ec PE + bionic unixlib, NDK AAudio headers) come
-          # from the container image above — mirror proton-wine/.github build args here.
-          ./configure --enable-archs=arm64ec --with-aaudio
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip flex bison gettext \
+            autoconf automake libtool pkg-config mingw-w64 \
+            gcc-multilib g++-multilib ccache \
+            libfreetype6-dev libfreetype6-dev:i386 \
+            libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
+
+      - name: Download termuxfs (aarch64)
+        run: |
+          mkdir -p $HOME/termuxfs/aarch64 && cd $HOME/termuxfs/aarch64
+          wget -q https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/Android/Sdk/ndk/27.3.13750724
+          key: android-ndk-r27d
+      - name: Set up Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $HOME/Android/Sdk/ndk && cd $HOME/Android/Sdk/ndk
+          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Cache LLVM MinGW toolchain
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+          key: bylaws-llvm-mingw-20250920
+      - name: Set up LLVM MinGW toolchain
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $HOME/toolchains && cd $HOME/toolchains
+          wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogen
+        working-directory: wine
+        run: bash build-scripts/build-step0-autogen.sh
+
+      - name: Cache wine-tools
+        id: cache-wine-tools
+        uses: actions/cache@v4
+        with:
+          path: wine/wine-tools
+          key: wine-tools-${{ env.PROTON_REF }}-${{ hashFiles('wine/configure.ac') }}
+      - name: Build wine-tools
+        if: steps.cache-wine-tools.outputs.cache-hit != 'true'
+        working-directory: wine
+        run: bash build-scripts/build-step0.sh
+
+      - name: Cache ccache (${{ matrix.label }})
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-da-${{ matrix.label }}-${{ github.sha }}
+          restore-keys: |
+            ccache-da-${{ matrix.label }}-
+
+      - name: Configure + build ONLY the DirectAudio driver
+        working-directory: wine
+        shell: bash
+        run: |
+          set -eo pipefail
+          # `source` so the arm64ec toolchain env the script exports (CC/CFLAGS/
+          # CROSSCFLAGS/PATH/DLLTOOL/…) persists into this shell for the targeted
+          # make below. The script also applies the bionic + GE patches + configures.
+          source build-scripts/build-step-arm64ec.sh ${{ matrix.page_flag }} --configure
+          echo "::group::make dlls/winedirectaudio.drv"
           make -j"$(nproc)" dlls/winedirectaudio.drv
+          echo "::endgroup::"
 
-      - name: Surface build products
+      - name: Collect + strip artifacts
         working-directory: wine
         run: |
-          ls -la dlls/winedirectaudio.drv/*.dll dlls/winedirectaudio.drv/*.so 2>/dev/null || true
+          set -e
+          STRIP="$HOME/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          OUT="$GITHUB_WORKSPACE/out/${{ matrix.label }}"
+          mkdir -p "$OUT"
+          PE=$(find . -type f -name 'winedirectaudio.drv' | head -1)
+          SO=$(find . -type f -name 'winedirectaudio.so'  | head -1)
+          echo "PE=$PE"; echo "SO=$SO"
+          test -n "$PE" && test -n "$SO"   # fail loudly if either is missing
+          cp -v "$PE" "$SO" "$OUT/"
+          "$STRIP" --strip-all "$OUT/winedirectaudio.drv" 2>/dev/null || true
+          "$STRIP" --strip-all "$OUT/winedirectaudio.so"  2>/dev/null || true
+          echo "--- artifacts (${{ matrix.label }}) ---"; ls -la "$OUT"
+          file "$OUT"/* || true
+
+      - name: Upload hot-swap artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: directaudio-${{ matrix.label }}
+          path: out/${{ matrix.label }}/*
+          retention-days: 30
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/directaudio-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Stage per-page-size zips
+        run: |
+          set -e
+          mkdir -p release
+          for d in artifacts/directaudio-*; do
+            n=$(basename "$d")
+            (cd "$d" && zip -qr "$GITHUB_WORKSPACE/release/${n}.zip" .)
+          done
+          ls -la release
+      - name: Attach to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          body: |
+            **DirectAudio hot-swap driver** — native Wine → Android AAudio (`winedirectaudio.drv`).
+            ABI-matched to Wine 11.0 (${{ env.PROTON_REF }}). Swap into the device Proton layer's
+            `lib/wine/aarch64-windows/winedirectaudio.drv` + `lib/wine/aarch64-unix/winedirectaudio.so`.
+            - `directaudio-arm64ec-sdk28.zip` — 4KB-page devices
+            - `directaudio-arm64ec-sdk35.zip` — 16KB-page devices
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
