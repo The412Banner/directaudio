@@ -1,0 +1,5 @@
+# build products (built inside the consuming Wine tree, never committed here)
+*.o
+*.so
+*.dll
+*.a

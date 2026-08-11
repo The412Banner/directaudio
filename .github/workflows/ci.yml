@@ -1,0 +1,59 @@
+name: build (compile-check against pinned Wine base)
+
+# A Wine driver can't build standalone — it needs the Wine tree + toolchain.
+# This job overlays the PR's driver source onto a pinned proton-wine checkout
+# and builds ONLY dlls/winedirectaudio.drv, to prove it compiles and links the
+# mmdevapi unixlib ABI. On-device audio is verified separately (no device in CI).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+# The Wine base this driver revision is ABI-matched to. Bump when re-pinning.
+env:
+  PROTON_REPO: The412Banner/proton-wine
+  PROTON_REF:  ge-proton11-5-bionic-staging   # Wine 11.0 base
+
+jobs:
+  compile-check:
+    runs-on: ubuntu-latest
+    # Reuse the same arm64ec/bionic build image proton-wine's own workflow uses.
+    # container: ghcr.io/the412banner/proton-bionic-arm64ec:latest   # <-- wire to your existing image
+    steps:
+      - name: Checkout pinned Wine base
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PROTON_REPO }}
+          ref: ${{ env.PROTON_REF }}
+          path: wine
+          fetch-depth: 1
+
+      - name: Overlay this PR's driver into the Wine tree
+        uses: actions/checkout@v4
+        with:
+          path: driver
+
+      - name: Place driver + integration deltas
+        run: |
+          set -e
+          cp driver/directaudio.c driver/Makefile.in wine/dlls/winedirectaudio.drv/
+          # The two host-tree deltas normally carried by the consumer; the pinned
+          # base above already contains them, so nothing to patch here. If testing
+          # against a clean upstream Wine, apply INTEGRATION.md first.
+
+      - name: Configure + build only the DirectAudio driver
+        working-directory: wine
+        run: |
+          set -e
+          ./tools/make_requests || true
+          # Toolchain flags (arm64ec PE + bionic unixlib, NDK AAudio headers) come
+          # from the container image above — mirror proton-wine/.github build args here.
+          ./configure --enable-archs=arm64ec --with-aaudio
+          make -j"$(nproc)" dlls/winedirectaudio.drv
+
+      - name: Surface build products
+        working-directory: wine
+        run: |
+          ls -la dlls/winedirectaudio.drv/*.dll dlls/winedirectaudio.drv/*.so 2>/dev/null || true
