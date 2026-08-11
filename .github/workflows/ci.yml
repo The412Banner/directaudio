@@ -136,9 +136,15 @@ jobs:
           # CROSSCFLAGS/PATH/DLLTOOL/…) persists into this shell for the targeted
           # make below. The script also applies the bionic + GE patches + configures.
           source build-scripts/build-step-arm64ec.sh ${{ matrix.page_flag }} --configure
-          echo "::group::make dlls/winedirectaudio.drv"
-          make -j"$(nproc)" dlls/winedirectaudio.drv
+          echo "::group::make driver (explicit file targets — the dir target is a no-op)"
+          make -j"$(nproc)" \
+            dlls/winedirectaudio.drv/winedirectaudio.drv \
+            dlls/winedirectaudio.drv/winedirectaudio.so
           echo "::endgroup::"
+          echo "=== driver dir after build ==="
+          ls -la dlls/winedirectaudio.drv/ || true
+          echo "=== any winedirectaudio.* build products ==="
+          find . -name 'winedirectaudio.*' ! -name '*.c' 2>/dev/null | head
 
       - name: Collect + strip artifacts
         working-directory: wine
