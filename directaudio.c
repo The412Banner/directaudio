@@ -1057,6 +1057,7 @@ static NTSTATUS unix_get_device_period(void *args)
 
     if (params->def_period) *params->def_period = def_period;
     if (params->min_period) *params->min_period = min_period;
+    DA_LOG("game get_device_period: flow=%d def=%lld min=%lld", params->flow, (long long)def_period, (long long)min_period);
     TRACE("get_device_period: flow=%d def=%d min=%d\n", params->flow, (int)def_period, (int)min_period);
     params->result = S_OK;
     return STATUS_SUCCESS;
@@ -1070,6 +1071,7 @@ static NTSTATUS unix_get_buffer_size(void *args)
     pthread_mutex_lock(&stream->lock);
     *params->frames = stream->bufsize_frames;
     pthread_mutex_unlock(&stream->lock);
+    DA_LOG("game get_buffer_size: stream=%p frames=%u", stream, (unsigned)*params->frames);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1086,7 +1088,7 @@ static NTSTATUS unix_get_latency(void *args)
     /* pretend we process audio in Period chunks, so max latency includes it */
     *params->latency = muldiv(buf_frames, 10000000, stream->fmt->nSamplesPerSec) + stream->period;
     pthread_mutex_unlock(&stream->lock);
-
+    DA_LOG("game get_latency: stream=%p latency=%lld", stream, (long long)*params->latency);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1392,6 +1394,8 @@ static NTSTATUS unix_get_position(void *args)
     }
 
     pthread_mutex_unlock(&stream->lock);
+    { static unsigned gpos_n; if ((++gpos_n % 200) == 0)
+        DA_LOG("game get_position#%u: stream=%p pos=%llu", gpos_n, stream, (unsigned long long)*params->pos); }
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1406,6 +1410,7 @@ static NTSTATUS unix_get_frequency(void *args)
     else
         *params->freq = stream->fmt->nSamplesPerSec;
 
+    DA_LOG("game get_frequency: stream=%p freq=%llu share=%d", stream, (unsigned long long)*params->freq, stream->share);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1416,6 +1421,7 @@ static NTSTATUS unix_is_started(void *args)
     struct directaudio_stream *stream = handle_get_stream(params->stream);
 
     params->result = stream->playing ? S_OK : S_FALSE;
+    DA_LOG("game is_started: stream=%p playing=%d", stream, (int)stream->playing);
     return STATUS_SUCCESS;
 }
 
