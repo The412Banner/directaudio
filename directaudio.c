@@ -36,6 +36,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <aaudio/AAudio.h>
 
@@ -264,7 +265,8 @@ struct directaudio_mixer
     BOOL adaptive;
     int32_t max_buf_frames, target_buf_frames;
     int32_t last_xrun;
-    int need_reopen;
+    int reopen_running;   /* a reopen worker thread is active */
+    int reopen_redo;      /* a reopen was requested; consumed by the worker */
     unsigned int cb_count;
 };
 
@@ -441,27 +443,37 @@ static void mixer_error_cb(AAudioStream *aq, void *user, aaudio_result_t error)
     struct directaudio_mixer *mx = user;
     int expected = 0;
 
-    /* Recreate the shared output on the errors that leave the stream unusable:
-     * DISCONNECTED is the route change (headphone/BT/HDMI), and INVALID_STATE/
-     * INVALID_HANDLE/TIMEOUT are the transient-death codes GameNative's
-     * module-aaudio-sink.c also recovers from. Handling the wider set (rather
-     * than DISCONNECTED alone) hardens recovery against stream death from any of
-     * these causes and matches GN's proven behavior. */
+    /* Only the live, promoted stream matters. Ignore errors from a stream that
+     * is not current: the OLD stream while it is torn down during a reopen, and
+     * the NEW stream during its own startup (it is not swapped into mx->aq until
+     * it has started). Without this guard, broadening the trigger set below made
+     * each reopen's own teardown/startup fire further reopens -> churn that, via
+     * a dropped in-flight request, ended in silence after a few route changes. */
+    if (aq != __atomic_load_n(&mx->aq, __ATOMIC_SEQ_CST))
+        return;
+
+    /* Reopen on the errors that leave the stream unusable: DISCONNECTED is the
+     * route change (headphone/BT/HDMI); INVALID_STATE/INVALID_HANDLE/TIMEOUT are
+     * the transient-death codes GameNative's module-aaudio-sink.c also recovers
+     * from. */
     if (error != AAUDIO_ERROR_DISCONNECTED &&
         error != AAUDIO_ERROR_INVALID_STATE &&
         error != AAUDIO_ERROR_INVALID_HANDLE &&
         error != AAUDIO_ERROR_TIMEOUT)
         return;
 
-    /* AAudio requires the reopen to happen on another thread, never inside this
-     * callback. */
-    if (__atomic_compare_exchange_n(&mx->need_reopen, &expected, 1, 0,
+    /* Record the request first, then start a worker only if none is running. A
+     * request that lands while a reopen is in flight is NOT lost: reopen_redo
+     * stays set and the running worker loops again (see mixer_reopen_thread).
+     * The reopen must run off this callback thread, never inline. */
+    __atomic_store_n(&mx->reopen_redo, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_compare_exchange_n(&mx->reopen_running, &expected, 1, 0,
                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
     {
         pthread_t th;
-        WARN("stream error/route change (err=%d) - reopening mixer output\n", error);
+        WARN("stream error (err=%d) - reopening mixer output\n", error);
         if (pthread_create(&th, NULL, mixer_reopen_thread, mx))
-            __atomic_store_n(&mx->need_reopen, 0, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&mx->reopen_running, 0, __ATOMIC_SEQ_CST);
         else
             pthread_detach(th);
     }
@@ -533,28 +545,55 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
 static void *mixer_reopen_thread(void *user)
 {
     struct directaudio_mixer *mx = user;
-    AAudioStream *old = NULL, *neu = NULL;
 
-    if (mixer_open_stream(mx, &neu) == AAUDIO_OK)
+    for (;;)
     {
-        pthread_mutex_lock(&mx->lock);
-        old = mx->aq;
-        mx->aq = neu;
-        pthread_mutex_unlock(&mx->lock);
-    }
-    else
-        WARN("mixer route-change reopen failed; keeping old stream\n");
+        AAudioStream *old = NULL, *neu = NULL;
+        int expected = 0;
 
-    /* close() blocks until the old stream's in-flight callback returns; do it
-     * outside the lock so the callback can drain. */
-    if (old)
-    {
-        AAudioStream_requestStop(old);
-        AAudioStream_close(old);
-        TRACE("reopened mixer output on route change\n");
-    }
+        /* Consume the pending request BEFORE the work, so a request that arrives
+         * during this pass re-sets the flag and we loop again below. */
+        __atomic_store_n(&mx->reopen_redo, 0, __ATOMIC_SEQ_CST);
 
-    __atomic_store_n(&mx->need_reopen, 0, __ATOMIC_SEQ_CST);
+        if (mixer_open_stream(mx, &neu) == AAUDIO_OK)
+        {
+            pthread_mutex_lock(&mx->lock);
+            old = mx->aq;
+            __atomic_store_n(&mx->aq, neu, __ATOMIC_SEQ_CST);
+            pthread_mutex_unlock(&mx->lock);
+        }
+        else
+            WARN("mixer reopen failed; keeping old stream\n");
+
+        /* close() blocks until the old stream's in-flight callback returns; do
+         * it outside the lock so that callback can drain. */
+        if (old)
+        {
+            AAudioStream_requestStop(old);
+            AAudioStream_close(old);
+            TRACE("reopened mixer output\n");
+        }
+
+        /* Another request during the work? Loop again (no lost wakeup). A short
+         * settle avoids a tight spin if a wedged route keeps killing the new
+         * stream immediately. */
+        if (__atomic_load_n(&mx->reopen_redo, __ATOMIC_SEQ_CST))
+        {
+            usleep(20000); /* 20 ms */
+            continue;
+        }
+
+        /* Nothing pending: release the worker slot, then close the clear/
+         * re-request race - a request that set reopen_redo after the check above
+         * but before we cleared reopen_running. Re-acquire and loop; otherwise a
+         * concurrent error_cb has already taken the slot and will run a worker. */
+        __atomic_store_n(&mx->reopen_running, 0, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&mx->reopen_redo, __ATOMIC_SEQ_CST))
+            break;
+        if (!__atomic_compare_exchange_n(&mx->reopen_running, &expected, 1, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            break;
+    }
     return NULL;
 }
 
