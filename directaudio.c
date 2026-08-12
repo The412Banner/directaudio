@@ -46,6 +46,7 @@
 #define __INTRODUCED_IN(api_level)
 #include <aaudio/AAudio.h>
 #include <android/api-level.h>
+#include <android/log.h>
 
 /* setUsage is API 28+. Redeclared weak so the linker leaves its address NULL on
  * older libaaudio instead of failing dlopen; the guard in mixer_open_stream only
@@ -69,6 +70,12 @@ extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuild
 #include "../mmdevapi/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(directaudio);
+
+/* Latency instrumentation — logs straight to Android logcat (tag "DirectAudio"),
+ * independent of WINEDEBUG and safe on the RT callback thread (pure Android call,
+ * no Wine TEB needed). Read on device with:  logcat -s DirectAudio:I
+ * latency_ms = frames / sample_rate * 1000. */
+#define DA_LOG(...) __android_log_print(ANDROID_LOG_INFO, "DirectAudio", __VA_ARGS__)
 
 struct directaudio_stream
 {
@@ -411,10 +418,17 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         }
     }
 
-    if (TRACE_ON(directaudio) && !(++mx->cb_count % 1000))
-        TRACE("mix hb: cb=%u voices=%d buf=%d cap=%d xruns=%d\n", mx->cb_count, mx->nvoices,
-              AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
-              AAudioStream_getXRunCount(aq));
+    /* Heartbeat to logcat every ~1000 callbacks (~a few seconds) — reports the
+     * EFFECTIVE buffer under load, which is the real in-game latency once the
+     * adaptive path has grown it on xruns. */
+    if (!(++mx->cb_count % 1000))
+    {
+        int32_t rate  = AAudioStream_getSampleRate(aq);
+        int32_t bufsz = AAudioStream_getBufferSizeInFrames(aq);
+        DA_LOG("hb: cb=%u voices=%d buf=%d(%.2fms) cap=%d xruns=%d", mx->cb_count, mx->nvoices,
+               bufsz, rate > 0 ? bufsz * 1000.0 / rate : 0.0,
+               AAudioStream_getBufferCapacityInFrames(aq), AAudioStream_getXRunCount(aq));
+    }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -520,6 +534,19 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     TRACE("mixer open: 48000/float/2ch perf=%d burst=%d buf=%d cap=%d\n", mx->perf,
           AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferSizeInFrames(aq),
           AAudioStream_getBufferCapacityInFrames(aq));
+
+    {
+        int32_t rate  = AAudioStream_getSampleRate(aq);
+        int32_t burst = AAudioStream_getFramesPerBurst(aq);
+        int32_t bufsz = AAudioStream_getBufferSizeInFrames(aq);
+        int32_t cap   = AAudioStream_getBufferCapacityInFrames(aq);
+        int      got  = (int)AAudioStream_getPerformanceMode(aq);
+        double   ms   = rate > 0 ? 1000.0 / rate : 0.0;
+        /* perf_got == 12 (LOW_LATENCY) confirms the fast/MMAP path was granted.
+         * buf_ms is the effective output latency at open. */
+        DA_LOG("open: perf_req=%d perf_got=%d rate=%d burst=%d(%.2fms) buf=%d(%.2fms) cap=%d(%.2fms)",
+               mx->perf, got, rate, burst, burst * ms, bufsz, bufsz * ms, cap, cap * ms);
+    }
 
     *out = aq;
     return AAUDIO_OK;
@@ -725,6 +752,7 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
     params->num = (params->flow == eRender) ? 1 : 0;
 
     TRACE("get_endpoint_ids: flow=%d -> num=%u\n", params->flow, params->num);
+    DA_LOG("game get_endpoint_ids: flow=%d -> num=%u default_idx=%u", params->flow, params->num, params->default_idx);
 
     if (params->num == 0)
     {
@@ -845,6 +873,8 @@ static NTSTATUS unix_create_stream(void *args)
 end:
     if (FAILED(params->result))
     {
+        DA_LOG("game create_stream FAIL: stream=%p flow=%d share=%d flags=0x%x result=0x%x",
+               stream, params->flow, params->share, (unsigned)params->flags, (unsigned)params->result);
         if (stream->in_mixer)
             mixer_remove_voice(&g_mixer, stream);
         if (stream->local_buffer)
@@ -861,6 +891,9 @@ end:
     {
         *params->channel_count = params->fmt->nChannels;
         *params->stream = (stream_handle)(UINT_PTR)stream;
+        DA_LOG("game create_stream OK: stream=%p flow=%d share=%d flags=0x%x period=%lld voices=%d",
+               stream, params->flow, params->share, (unsigned)params->flags,
+               (long long)stream->period, g_mixer.nvoices);
     }
 
     return STATUS_SUCCESS;
@@ -872,18 +905,22 @@ static NTSTATUS unix_release_stream(void *args)
     struct directaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
+    DA_LOG("game release_stream: stream=%p timer_thread=%d in_mixer=%d",
+           stream, !!params->timer_thread, stream->in_mixer);
     if (params->timer_thread)
     {
         LARGE_INTEGER timeout;
         __atomic_store_n(&stream->please_quit, TRUE, __ATOMIC_SEQ_CST);
-        /* Bound the join. A game that creates+starts+releases a transient stream
-         * during init (e.g. God of War via FAudio) otherwise deadlocks its main
-         * thread here on an unbounded wait -> load hangs at a black screen. If the
-         * timer thread does not exit promptly, unblock the caller and leak the
-         * stream rather than free memory the still-running timer touches (UAF). */
         timeout.QuadPart = -5000000; /* 500 ms */
         if (NtWaitForSingleObject(params->timer_thread, FALSE, &timeout) != STATUS_SUCCESS)
         {
+            /* The timer thread did not exit promptly. Observed when a game
+             * creates+starts+releases a transient stream during init (e.g. GoW):
+             * the unbounded synchronous join then deadlocks the game's main
+             * thread -> load hangs at a black screen. Never block the caller:
+             * close our handle ref and LEAK the stream rather than free memory
+             * the still-running timer thread touches (UAF). */
+            DA_LOG("game release_stream: timer join TIMEOUT stream=%p - leaking to unblock", stream);
             WARN("release_stream: timer thread stuck; leaking stream to avoid hang\n");
             NtClose(params->timer_thread);
             params->result = S_OK;
@@ -952,6 +989,7 @@ static NTSTATUS unix_get_mix_format(void *args)
     params->fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
 
     TRACE("get_mix_format: flow=%d -> 48000/32f/2ch\n", params->flow);
+    DA_LOG("game get_mix_format: flow=%d -> 48000/32f/2ch", params->flow);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1012,6 +1050,9 @@ static NTSTATUS unix_is_format_supported(void *args)
     TRACE("is_format_supported: share=%d tag=%#x ch=%u rate=%u bits=%u aafmt=%d -> %#x\n",
           params->share, fmt->wFormatTag, fmt->nChannels, (unsigned)fmt->nSamplesPerSec,
           fmt->wBitsPerSample, aafmt, (unsigned)params->result);
+    DA_LOG("game is_format_supported: flow=%d share=%d tag=%#x ch=%u rate=%u bits=%u -> 0x%x",
+           params->flow, params->share, fmt->wFormatTag, fmt->nChannels,
+           (unsigned)fmt->nSamplesPerSec, fmt->wBitsPerSample, (unsigned)params->result);
     return STATUS_SUCCESS;
 }
 
@@ -1021,6 +1062,7 @@ static NTSTATUS unix_get_device_period(void *args)
 
     if (params->def_period) *params->def_period = def_period;
     if (params->min_period) *params->min_period = min_period;
+    DA_LOG("game get_device_period: flow=%d def=%lld min=%lld", params->flow, (long long)def_period, (long long)min_period);
     TRACE("get_device_period: flow=%d def=%d min=%d\n", params->flow, (int)def_period, (int)min_period);
     params->result = S_OK;
     return STATUS_SUCCESS;
@@ -1034,6 +1076,7 @@ static NTSTATUS unix_get_buffer_size(void *args)
     pthread_mutex_lock(&stream->lock);
     *params->frames = stream->bufsize_frames;
     pthread_mutex_unlock(&stream->lock);
+    DA_LOG("game get_buffer_size: stream=%p frames=%u", stream, (unsigned)*params->frames);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1050,7 +1093,7 @@ static NTSTATUS unix_get_latency(void *args)
     /* pretend we process audio in Period chunks, so max latency includes it */
     *params->latency = muldiv(buf_frames, 10000000, stream->fmt->nSamplesPerSec) + stream->period;
     pthread_mutex_unlock(&stream->lock);
-
+    DA_LOG("game get_latency: stream=%p latency=%lld", stream, (long long)*params->latency);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1067,6 +1110,9 @@ static NTSTATUS unix_get_current_padding(void *args)
 
     pthread_mutex_lock(&stream->lock);
     *params->padding = get_current_padding_nolock(stream);
+    { static unsigned gp_n; if ((++gp_n % 500) == 0)
+        DA_LOG("game pad#%u: pad=%u held=%u playing=%d", gp_n, (unsigned)*params->padding,
+               (unsigned)stream->held_frames, (int)stream->playing); }
     pthread_mutex_unlock(&stream->lock);
     params->result = S_OK;
     return STATUS_SUCCESS;
@@ -1089,6 +1135,10 @@ static NTSTATUS unix_start(void *args)
         params->result = S_OK;
     }
 
+    DA_LOG("game start: stream=%p flags=0x%x eventmode=%d event=%p in_mixer=%d -> result=0x%x",
+           stream, (unsigned)stream->flags,
+           !!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK),
+           stream->event, stream->in_mixer, (unsigned)params->result);
     pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
@@ -1143,6 +1193,8 @@ static NTSTATUS unix_timer_loop(void *args)
     LARGE_INTEGER delay, next, last;
     int adjust;
 
+    DA_LOG("game timer_loop START: stream=%p event=%p period=%lld",
+           stream, stream->event, (long long)stream->period);
     delay.QuadPart = -stream->period;
     NtQueryPerformanceCounter(&last, NULL);
     next.QuadPart = last.QuadPart + stream->period;
@@ -1150,7 +1202,11 @@ static NTSTATUS unix_timer_loop(void *args)
     while (!__atomic_load_n(&stream->please_quit, __ATOMIC_SEQ_CST))
     {
         if (stream->event)
+        {
             NtSetEvent(stream->event, NULL);
+            { static unsigned ev_n; if ((++ev_n % 100) == 0)
+                DA_LOG("game evsig#%u", ev_n); }
+        }
         NtDelayExecution(FALSE, &delay);
         NtQueryPerformanceCounter(&last, NULL);
 
@@ -1228,6 +1284,10 @@ static NTSTATUS unix_get_render_buffer(void *args)
     params->result = S_OK;
 
 end:
+    { static unsigned grb_n; if ((++grb_n % 100) == 0)
+        DA_LOG("game grb#%u: pad=%u held=%u wri=%u bufsz=%u result=0x%x", grb_n, pad,
+               (unsigned)stream->held_frames, (unsigned)stream->written_frames,
+               (unsigned)stream->bufsize_frames, (unsigned)params->result); }
     pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
@@ -1339,6 +1399,8 @@ static NTSTATUS unix_get_position(void *args)
     }
 
     pthread_mutex_unlock(&stream->lock);
+    { static unsigned gpos_n; if ((++gpos_n % 200) == 0)
+        DA_LOG("game get_position#%u: stream=%p pos=%llu", gpos_n, stream, (unsigned long long)*params->pos); }
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1353,6 +1415,7 @@ static NTSTATUS unix_get_frequency(void *args)
     else
         *params->freq = stream->fmt->nSamplesPerSec;
 
+    DA_LOG("game get_frequency: stream=%p freq=%llu share=%d", stream, (unsigned long long)*params->freq, stream->share);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1363,6 +1426,7 @@ static NTSTATUS unix_is_started(void *args)
     struct directaudio_stream *stream = handle_get_stream(params->stream);
 
     params->result = stream->playing ? S_OK : S_FALSE;
+    DA_LOG("game is_started: stream=%p playing=%d", stream, (int)stream->playing);
     return STATUS_SUCCESS;
 }
 
@@ -1379,6 +1443,7 @@ static NTSTATUS unix_get_prop_value(void *args)
 
     TRACE("get_prop_value: flow=%d prop=%s,%u\n", params->flow,
           wine_dbgstr_guid(&params->prop->fmtid), params->prop->pid);
+    DA_LOG("game get_prop_value: flow=%d pid=%u", params->flow, params->prop->pid);
 
     /* Games (e.g. DiRT 3) refuse to call IAudioClient::Initialize until they can
      * read PhysicalSpeakers from the endpoint, so (like winealsa/winepulse) we
@@ -1460,6 +1525,8 @@ static NTSTATUS unix_set_event_handle(void *args)
     pthread_mutex_unlock(&stream->lock);
 
     params->result = hr;
+    DA_LOG("game set_event_handle: stream=%p event=%p in_mixer=%d result=0x%x",
+           stream, params->event, stream->in_mixer, (unsigned)hr);
     return STATUS_SUCCESS;
 }
 
