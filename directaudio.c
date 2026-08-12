@@ -872,6 +872,8 @@ static NTSTATUS unix_create_stream(void *args)
 end:
     if (FAILED(params->result))
     {
+        DA_LOG("game create_stream FAIL: stream=%p flow=%d share=%d flags=0x%x result=0x%x",
+               stream, params->flow, params->share, (unsigned)params->flags, (unsigned)params->result);
         if (stream->in_mixer)
             mixer_remove_voice(&g_mixer, stream);
         if (stream->local_buffer)
@@ -888,6 +890,9 @@ end:
     {
         *params->channel_count = params->fmt->nChannels;
         *params->stream = (stream_handle)(UINT_PTR)stream;
+        DA_LOG("game create_stream OK: stream=%p flow=%d share=%d flags=0x%x period=%lld voices=%d",
+               stream, params->flow, params->share, (unsigned)params->flags,
+               (long long)stream->period, g_mixer.nvoices);
     }
 
     return STATUS_SUCCESS;
@@ -899,6 +904,8 @@ static NTSTATUS unix_release_stream(void *args)
     struct directaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
+    DA_LOG("game release_stream: stream=%p timer_thread=%d in_mixer=%d",
+           stream, !!params->timer_thread, stream->in_mixer);
     if (params->timer_thread)
     {
         stream->please_quit = TRUE;
@@ -1106,10 +1113,10 @@ static NTSTATUS unix_start(void *args)
         params->result = S_OK;
     }
 
-    DA_LOG("game start: flags=0x%x eventmode=%d event=%p -> result=0x%x",
-           (unsigned)stream->flags,
+    DA_LOG("game start: stream=%p flags=0x%x eventmode=%d event=%p in_mixer=%d -> result=0x%x",
+           stream, (unsigned)stream->flags,
            !!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK),
-           stream->event, (unsigned)params->result);
+           stream->event, stream->in_mixer, (unsigned)params->result);
     pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
@@ -1164,6 +1171,8 @@ static NTSTATUS unix_timer_loop(void *args)
     LARGE_INTEGER delay, next, last;
     int adjust;
 
+    DA_LOG("game timer_loop START: stream=%p event=%p period=%lld",
+           stream, stream->event, (long long)stream->period);
     delay.QuadPart = -stream->period;
     NtQueryPerformanceCounter(&last, NULL);
     next.QuadPart = last.QuadPart + stream->period;
@@ -1489,6 +1498,8 @@ static NTSTATUS unix_set_event_handle(void *args)
     pthread_mutex_unlock(&stream->lock);
 
     params->result = hr;
+    DA_LOG("game set_event_handle: stream=%p event=%p in_mixer=%d result=0x%x",
+           stream, params->event, stream->in_mixer, (unsigned)hr);
     return STATUS_SUCCESS;
 }
 
