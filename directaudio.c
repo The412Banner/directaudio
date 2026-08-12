@@ -752,6 +752,7 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
     params->num = (params->flow == eRender) ? 1 : 0;
 
     TRACE("get_endpoint_ids: flow=%d -> num=%u\n", params->flow, params->num);
+    DA_LOG("game get_endpoint_ids: flow=%d -> num=%u default_idx=%u", params->flow, params->num, params->default_idx);
 
     if (params->num == 0)
     {
@@ -988,6 +989,7 @@ static NTSTATUS unix_get_mix_format(void *args)
     params->fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
 
     TRACE("get_mix_format: flow=%d -> 48000/32f/2ch\n", params->flow);
+    DA_LOG("game get_mix_format: flow=%d -> 48000/32f/2ch", params->flow);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1048,6 +1050,9 @@ static NTSTATUS unix_is_format_supported(void *args)
     TRACE("is_format_supported: share=%d tag=%#x ch=%u rate=%u bits=%u aafmt=%d -> %#x\n",
           params->share, fmt->wFormatTag, fmt->nChannels, (unsigned)fmt->nSamplesPerSec,
           fmt->wBitsPerSample, aafmt, (unsigned)params->result);
+    DA_LOG("game is_format_supported: flow=%d share=%d tag=%#x ch=%u rate=%u bits=%u -> 0x%x",
+           params->flow, params->share, fmt->wFormatTag, fmt->nChannels,
+           (unsigned)fmt->nSamplesPerSec, fmt->wBitsPerSample, (unsigned)params->result);
     return STATUS_SUCCESS;
 }
 
@@ -1438,6 +1443,7 @@ static NTSTATUS unix_get_prop_value(void *args)
 
     TRACE("get_prop_value: flow=%d prop=%s,%u\n", params->flow,
           wine_dbgstr_guid(&params->prop->fmtid), params->prop->pid);
+    DA_LOG("game get_prop_value: flow=%d pid=%u", params->flow, params->prop->pid);
 
     /* Games (e.g. DiRT 3) refuse to call IAudioClient::Initialize until they can
      * read PhysicalSpeakers from the endpoint, so (like winealsa/winepulse) we
