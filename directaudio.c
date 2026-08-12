@@ -35,10 +35,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <dlfcn.h>
 #include <unistd.h>
 
+/* Blank the API-availability annotation before including AAudio.h so the API-28
+ * AAudioStreamBuilder_setUsage we weak-guard below is not emitted as a STRONG
+ * undefined symbol: this unixlib is linked -z now, so a strong ref to a symbol
+ * that API 26/27 libaaudio does not export would fail the whole .so load
+ * (DirectAudio dead on Android 8.x). */
+#undef __INTRODUCED_IN
+#define __INTRODUCED_IN(api_level)
 #include <aaudio/AAudio.h>
+#include <android/api-level.h>
+
+/* setUsage is API 28+. Redeclared weak so the linker leaves its address NULL on
+ * older libaaudio instead of failing dlopen; the guard in mixer_open_stream only
+ * calls it when present AND api_level >= 28 (per GN review). */
+extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuilder *builder,
+                                                               aaudio_usage_t usage);
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -56,36 +69,6 @@
 #include "../mmdevapi/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(directaudio);
-
-/* AAUDIO_USAGE_GAME hints AAudio toward the low-latency fast path. Both the
- * enum and AAudioStreamBuilder_setUsage() are API 28+, but Bannerlator's
- * minSdk is 26 and this unixlib direct-links libaaudio (the Android linker
- * binds symbols eagerly at dlopen). Referencing the symbol directly would make
- * the whole winedirectaudio.so fail to load on API 26/27 -> DirectAudio dead on
- * Android 8.x. So resolve it (and the api-level query) at runtime via dlsym and
- * only call it when present AND the device is API >= 28. Value is stable at 14;
- * define it here so the build does not need a 28+ AAudio header. */
-#ifndef AAUDIO_USAGE_GAME
-#define AAUDIO_USAGE_GAME 14
-#endif
-
-typedef void (*pfn_AAudioStreamBuilder_setUsage)(AAudioStreamBuilder *, int32_t);
-typedef int  (*pfn_android_get_device_api_level)(void);
-static pfn_AAudioStreamBuilder_setUsage p_AAudioStreamBuilder_setUsage;
-static int aaudio_usage_supported;   /* symbol resolved AND api_level >= 28 */
-static pthread_once_t aaudio_usage_once = PTHREAD_ONCE_INIT;
-
-static void resolve_aaudio_usage(void)
-{
-    pfn_android_get_device_api_level p_api;
-
-    p_AAudioStreamBuilder_setUsage =
-        (pfn_AAudioStreamBuilder_setUsage)dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setUsage");
-    p_api = (pfn_android_get_device_api_level)dlsym(RTLD_DEFAULT, "android_get_device_api_level");
-    aaudio_usage_supported = p_AAudioStreamBuilder_setUsage && p_api && p_api() >= 28;
-    TRACE("AAudioStreamBuilder_setUsage %s (usage_supported=%d)\n",
-          p_AAudioStreamBuilder_setUsage ? "resolved" : "absent", aaudio_usage_supported);
-}
 
 struct directaudio_stream
 {
@@ -493,11 +476,11 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setPerformanceMode(builder, mx->perf);
-    /* API 28+ only, resolved at runtime (see resolve_aaudio_usage): tags the
-     * output as game audio so AAudio prefers the low-latency route. */
-    pthread_once(&aaudio_usage_once, resolve_aaudio_usage);
-    if (aaudio_usage_supported)
-        p_AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
+    /* API 28+ only: the weak ref (declared near the AAudio.h include) stays NULL
+     * on older libaaudio so the .so still loads; tag output as game audio so
+     * AAudio prefers the low-latency route. */
+    if (AAudioStreamBuilder_setUsage && android_get_device_api_level() >= 28)
+        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
     AAudioStreamBuilder_setChannelCount(builder, MIX_OUT_CHANNELS);
     AAudioStreamBuilder_setSampleRate(builder, MIX_OUT_RATE);
