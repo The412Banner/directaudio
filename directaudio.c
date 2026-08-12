@@ -874,8 +874,21 @@ static NTSTATUS unix_release_stream(void *args)
 
     if (params->timer_thread)
     {
-        stream->please_quit = TRUE;
-        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
+        LARGE_INTEGER timeout;
+        __atomic_store_n(&stream->please_quit, TRUE, __ATOMIC_SEQ_CST);
+        /* Bound the join. A game that creates+starts+releases a transient stream
+         * during init (e.g. God of War via FAudio) otherwise deadlocks its main
+         * thread here on an unbounded wait -> load hangs at a black screen. If the
+         * timer thread does not exit promptly, unblock the caller and leak the
+         * stream rather than free memory the still-running timer touches (UAF). */
+        timeout.QuadPart = -5000000; /* 500 ms */
+        if (NtWaitForSingleObject(params->timer_thread, FALSE, &timeout) != STATUS_SUCCESS)
+        {
+            WARN("release_stream: timer thread stuck; leaking stream to avoid hang\n");
+            NtClose(params->timer_thread);
+            params->result = S_OK;
+            return STATUS_SUCCESS;
+        }
         NtClose(params->timer_thread);
     }
 
@@ -1134,7 +1147,7 @@ static NTSTATUS unix_timer_loop(void *args)
     NtQueryPerformanceCounter(&last, NULL);
     next.QuadPart = last.QuadPart + stream->period;
 
-    while (!stream->please_quit)
+    while (!__atomic_load_n(&stream->please_quit, __ATOMIC_SEQ_CST))
     {
         if (stream->event)
             NtSetEvent(stream->event, NULL);
