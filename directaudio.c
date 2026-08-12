@@ -908,8 +908,23 @@ static NTSTATUS unix_release_stream(void *args)
            stream, !!params->timer_thread, stream->in_mixer);
     if (params->timer_thread)
     {
-        stream->please_quit = TRUE;
-        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
+        LARGE_INTEGER timeout;
+        __atomic_store_n(&stream->please_quit, TRUE, __ATOMIC_SEQ_CST);
+        timeout.QuadPart = -5000000; /* 500 ms */
+        if (NtWaitForSingleObject(params->timer_thread, FALSE, &timeout) != STATUS_SUCCESS)
+        {
+            /* The timer thread did not exit promptly. Observed when a game
+             * creates+starts+releases a transient stream during init (e.g. GoW):
+             * the unbounded synchronous join then deadlocks the game's main
+             * thread -> load hangs at a black screen. Never block the caller:
+             * close our handle ref and LEAK the stream rather than free memory
+             * the still-running timer thread touches (UAF). */
+            DA_LOG("game release_stream: timer join TIMEOUT stream=%p - leaking to unblock", stream);
+            WARN("release_stream: timer thread stuck; leaking stream to avoid hang\n");
+            NtClose(params->timer_thread);
+            params->result = S_OK;
+            return STATUS_SUCCESS;
+        }
         NtClose(params->timer_thread);
     }
 
@@ -1177,7 +1192,7 @@ static NTSTATUS unix_timer_loop(void *args)
     NtQueryPerformanceCounter(&last, NULL);
     next.QuadPart = last.QuadPart + stream->period;
 
-    while (!stream->please_quit)
+    while (!__atomic_load_n(&stream->please_quit, __ATOMIC_SEQ_CST))
     {
         if (stream->event)
         {
