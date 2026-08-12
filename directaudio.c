@@ -1081,6 +1081,9 @@ static NTSTATUS unix_get_current_padding(void *args)
 
     pthread_mutex_lock(&stream->lock);
     *params->padding = get_current_padding_nolock(stream);
+    { static unsigned gp_n; if ((++gp_n % 500) == 0)
+        DA_LOG("game pad#%u: pad=%u held=%u playing=%d", gp_n, (unsigned)*params->padding,
+               (unsigned)stream->held_frames, (int)stream->playing); }
     pthread_mutex_unlock(&stream->lock);
     params->result = S_OK;
     return STATUS_SUCCESS;
@@ -1103,6 +1106,10 @@ static NTSTATUS unix_start(void *args)
         params->result = S_OK;
     }
 
+    DA_LOG("game start: flags=0x%x eventmode=%d event=%p -> result=0x%x",
+           (unsigned)stream->flags,
+           !!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK),
+           stream->event, (unsigned)params->result);
     pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
@@ -1164,7 +1171,11 @@ static NTSTATUS unix_timer_loop(void *args)
     while (!stream->please_quit)
     {
         if (stream->event)
+        {
             NtSetEvent(stream->event, NULL);
+            { static unsigned ev_n; if ((++ev_n % 100) == 0)
+                DA_LOG("game evsig#%u", ev_n); }
+        }
         NtDelayExecution(FALSE, &delay);
         NtQueryPerformanceCounter(&last, NULL);
 
@@ -1242,6 +1253,10 @@ static NTSTATUS unix_get_render_buffer(void *args)
     params->result = S_OK;
 
 end:
+    { static unsigned grb_n; if ((++grb_n % 100) == 0)
+        DA_LOG("game grb#%u: pad=%u held=%u wri=%u bufsz=%u result=0x%x", grb_n, pad,
+               (unsigned)stream->held_frames, (unsigned)stream->written_frames,
+               (unsigned)stream->bufsize_frames, (unsigned)params->result); }
     pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
