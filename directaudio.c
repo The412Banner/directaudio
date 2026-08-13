@@ -36,6 +36,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 
 /* Blank the API-availability annotation before including AAudio.h so the API-28
  * AAudioStreamBuilder_setUsage we weak-guard below is not emitted as a STRONG
@@ -307,7 +308,27 @@ struct directaudio_mixer
     int reopen_running;   /* a reopen worker thread is active */
     int reopen_redo;      /* a reopen was requested; consumed by the worker */
     unsigned int cb_count;
+
+    /* --- data-callback watchdog (see mixer_watchdog) --------------------------
+     * A rapid background/foreground cycle starves the in-process AAudio stream;
+     * AudioTrack then hits its "disabled due to previous underrun" path and the
+     * data callback NEVER resumes. No error callback fires for this, so the
+     * error-driven reopen above cannot see it and audio is lost until relaunch.
+     * These fields let the (still-ticking) timer loop notice a dead callback. */
+    UINT64 last_cb_ns;        /* monotonic ns of the most recent data callback */
+    UINT64 wd_last_tick_ns;   /* monotonic ns of the previous watchdog tick */
+    unsigned int wd_last_cb;  /* cb_count observed at the previous tick */
 };
+
+#define DA_FREEZE_GAP_NS  500000000ull   /* tick gap this large => guest was suspended */
+#define DA_CB_STALL_NS   1000000000ull   /* callback silent this long => stream is dead */
+
+static inline UINT64 da_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (UINT64)ts.tv_sec * 1000000000ull + (UINT64)ts.tv_nsec;
+}
 
 static struct directaudio_mixer g_mixer = { PTHREAD_MUTEX_INITIALIZER };
 
@@ -448,6 +469,23 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         else if (out[i] < -1.0f) out[i] = -1.0f;
     }
 
+    /* Liveness for the watchdog. This MUST be unconditional - it used to be
+     * folded into the TRACE_ON() test below, so with tracing off it never
+     * advanced and a dead callback was indistinguishable from a live one. */
+    {
+        UINT64 now = da_now_ns();
+        UINT64 prev = __atomic_exchange_n(&mx->last_cb_ns, now, __ATOMIC_SEQ_CST);
+
+        /* Coming back from a suspension (app backgrounded => guest SIGSTOPped),
+         * the xrun counter has jumped by however long we were frozen. Those are
+         * not a timing signal, so re-baseline instead of growing: otherwise a
+         * few background/foreground cycles inflate the buffer permanently
+         * (observed: 192 -> 5568 frames, 4 ms -> 116 ms, and growth never shrinks). */
+        if (prev && now - prev > DA_FREEZE_GAP_NS)
+            mx->last_xrun = AAudioStream_getXRunCount(aq);
+    }
+    __atomic_add_fetch(&mx->cb_count, 1, __ATOMIC_SEQ_CST);
+
     /* Adaptive: grow the single output's buffer by a burst on each xrun climb,
      * capped at max_buf_frames (or capacity). One output = one xrun source. */
     if (mx->adaptive)
@@ -467,7 +505,7 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         }
     }
 
-    if (TRACE_ON(directaudio) && !(++mx->cb_count % 1000))
+    if (TRACE_ON(directaudio) && !(mx->cb_count % 1000))
         TRACE("mix hb: cb=%u voices=%d buf=%d cap=%d xruns=%d\n", mx->cb_count, mx->nvoices,
               AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
               AAudioStream_getXRunCount(aq));
@@ -477,10 +515,30 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
 
 static void *mixer_reopen_thread(void *user);
 
+/* Ask for the output to be rebuilt. Safe from any thread, including an AAudio
+ * callback: the work always runs on a detached worker, never inline. A request
+ * that lands while a reopen is in flight is NOT lost - reopen_redo stays set and
+ * the running worker loops again (see mixer_reopen_thread). */
+static void mixer_request_reopen(struct directaudio_mixer *mx, const char *why)
+{
+    int expected = 0;
+
+    __atomic_store_n(&mx->reopen_redo, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_compare_exchange_n(&mx->reopen_running, &expected, 1, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    {
+        pthread_t th;
+        WARN("%s - reopening mixer output\n", why);
+        if (pthread_create(&th, NULL, mixer_reopen_thread, mx))
+            __atomic_store_n(&mx->reopen_running, 0, __ATOMIC_SEQ_CST);
+        else
+            pthread_detach(th);
+    }
+}
+
 static void mixer_error_cb(AAudioStream *aq, void *user, aaudio_result_t error)
 {
     struct directaudio_mixer *mx = user;
-    int expected = 0;
 
     /* Only the live, promoted stream matters. Ignore errors from a stream that
      * is not current: the OLD stream while it is torn down during a reopen, and
@@ -501,21 +559,7 @@ static void mixer_error_cb(AAudioStream *aq, void *user, aaudio_result_t error)
         error != AAUDIO_ERROR_TIMEOUT)
         return;
 
-    /* Record the request first, then start a worker only if none is running. A
-     * request that lands while a reopen is in flight is NOT lost: reopen_redo
-     * stays set and the running worker loops again (see mixer_reopen_thread).
-     * The reopen must run off this callback thread, never inline. */
-    __atomic_store_n(&mx->reopen_redo, 1, __ATOMIC_SEQ_CST);
-    if (__atomic_compare_exchange_n(&mx->reopen_running, &expected, 1, 0,
-                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-    {
-        pthread_t th;
-        WARN("stream error (err=%d) - reopening mixer output\n", error);
-        if (pthread_create(&th, NULL, mixer_reopen_thread, mx))
-            __atomic_store_n(&mx->reopen_running, 0, __ATOMIC_SEQ_CST);
-        else
-            pthread_detach(th);
-    }
+    mixer_request_reopen(mx, "stream error");
 }
 
 /* open the one shared AAudio output: 48 kHz / float / stereo */
@@ -576,6 +620,9 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     TRACE("mixer open: 48000/float/2ch perf=%d burst=%d buf=%d cap=%d\n", mx->perf,
           AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferSizeInFrames(aq),
           AAudioStream_getBufferCapacityInFrames(aq));
+
+    __atomic_store_n(&mx->last_cb_ns, da_now_ns(), __ATOMIC_SEQ_CST);
+    mx->wd_last_tick_ns = 0;   /* re-baseline the watchdog against the new stream */
 
     *out = aq;
     return AAUDIO_OK;
@@ -1192,6 +1239,48 @@ static NTSTATUS unix_reset(void *args)
     return STATUS_SUCCESS;
 }
 
+/* Called once per mmdevapi period from the timer loop, which keeps ticking even
+ * when the audio output is dead. Detects the failure mode that raises no error:
+ * the AAudio data callback stops firing after AudioTrack disables itself
+ * ("disabled due to previous underrun"), leaving playing=1, the guest ring full
+ * and permanent silence. Device-proven trigger: rapid background/foreground. */
+static void mixer_watchdog(struct directaudio_mixer *mx)
+{
+    UINT64 now = da_now_ns(), last_cb, prev_tick;
+    unsigned int cb;
+
+    if (!__atomic_load_n(&mx->aq, __ATOMIC_SEQ_CST)) return;   /* no output open */
+    if (!__atomic_load_n(&mx->nvoices, __ATOMIC_SEQ_CST)) return; /* nothing playing */
+
+    prev_tick = mx->wd_last_tick_ns;
+    mx->wd_last_tick_ns = now;
+    cb = __atomic_load_n(&mx->cb_count, __ATOMIC_SEQ_CST);
+
+    /* Our own cadence jumped => the guest was suspended, not starved. Re-baseline
+     * and give the callback a fresh window to come back on its own; tripping here
+     * would recreate the stream after every background/foreground cycle. */
+    if (!prev_tick || now - prev_tick > DA_FREEZE_GAP_NS)
+    {
+        mx->wd_last_cb = cb;
+        __atomic_store_n(&mx->last_cb_ns, now, __ATOMIC_SEQ_CST);
+        return;
+    }
+
+    if (cb != mx->wd_last_cb)   /* callback is alive */
+    {
+        mx->wd_last_cb = cb;
+        return;
+    }
+
+    last_cb = __atomic_load_n(&mx->last_cb_ns, __ATOMIC_SEQ_CST);
+    if (!last_cb || now - last_cb < DA_CB_STALL_NS) return;
+
+    /* Silent for DA_CB_STALL_NS with voices playing and no error reported. The
+     * stream cannot be restarted (same rule as a route change) - rebuild it. */
+    __atomic_store_n(&mx->last_cb_ns, now, __ATOMIC_SEQ_CST);  /* arm one shot */
+    mixer_request_reopen(mx, "data callback stalled");
+}
+
 static NTSTATUS unix_timer_loop(void *args)
 {
     struct timer_loop_params *params = args;
@@ -1205,6 +1294,8 @@ static NTSTATUS unix_timer_loop(void *args)
 
     while (!__atomic_load_n(&stream->please_quit, __ATOMIC_SEQ_CST))
     {
+        mixer_watchdog(&g_mixer);
+
         if (stream->event)
             NtSetEvent(stream->event, NULL);
         NtDelayExecution(FALSE, &delay);
