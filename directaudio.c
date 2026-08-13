@@ -979,7 +979,10 @@ static NTSTATUS unix_get_mix_format(void *args)
     params->fmt->Format.nSamplesPerSec = 48000;
     params->fmt->Format.wBitsPerSample = 32;
     params->fmt->dwChannelMask = get_channel_mask(2);
-    params->fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    /* EXPERIMENT: advertise 32-bit PCM (not IEEE_FLOAT) to mirror what winealsa
+     * returns on this device (Android ALSA mask lacks FLOAT_LE). The in-process
+     * mixer converts the guest's PCM voice to float for AAudio via samp_to_float. */
+    params->fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
 
     params->fmt->Format.nBlockAlign = params->fmt->Format.wBitsPerSample *
         params->fmt->Format.nChannels / 8;
@@ -988,8 +991,8 @@ static NTSTATUS unix_get_mix_format(void *args)
     params->fmt->Samples.wValidBitsPerSample = params->fmt->Format.wBitsPerSample;
     params->fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
 
-    TRACE("get_mix_format: flow=%d -> 48000/32f/2ch\n", params->flow);
-    DA_LOG("game get_mix_format: flow=%d -> 48000/32f/2ch", params->flow);
+    TRACE("get_mix_format: flow=%d -> 48000/32i/2ch\n", params->flow);
+    DA_LOG("game get_mix_format: flow=%d -> 48000/32i/2ch (PCM experiment)", params->flow);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1030,21 +1033,19 @@ static NTSTATUS unix_is_format_supported(void *args)
     }
     else /* AUDCLNT_SHAREMODE_SHARED */
     {
-        /* Shared mode goes through mmdevapi's mixer, which converts the guest
-         * format to our AAudio mix format - exactly like the winealsa/winepulse
-         * software-mixer backends. So report S_OK for any layout mmdevapi has
-         * already validated, INCLUDING formats AAudio cannot open natively
-         * (8-bit / 24-bit PCM): the guest only uses these to probe device
-         * capability and always initialises the stream with the float mix
-         * format (device-verified against DiRT 3's WASAPI negotiation). Both
-         * known-good backends answer S_OK here; returning anything weaker
-         * (S_FALSE, and certainly a hard AUDCLNT_E_UNSUPPORTED_FORMAT) makes the
-         * game judge the endpoint incapable and fall back to legacy winmm, which
-         * is what stalled DiRT 3's boot on the two prior builds.
-         * TODO: if a title ever *initialises* a shared stream with a non-native
-         * format, create_stream must convert it to the mix format rather than
-         * fail; no observed title does this yet. */
-        params->result = S_OK;
+        /* EXPERIMENT (GoW black-screen hunt): mirror winealsa EXACTLY. The device
+         * winealsa trace shows Android ALSA's format mask has NO FLOAT_LE, so
+         * winealsa answers is_format_supported(IEEE_FLOAT) with a hard
+         * AUDCLNT_E_UNSUPPORTED_FORMAT and advertises a 32-bit *PCM* mix format;
+         * GoW then takes the PCM path and BOOTS. DirectAudio previously answered
+         * S_OK for float (+ a float mix format), sending GoW down the float path
+         * where its render pipeline stalls (black screen, audio fine). So here:
+         * reject float in shared mode, accept PCM layouts mmdevapi validated. */
+        BOOL is_float = fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+            (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+             IsEqualGUID(&((const WAVEFORMATEXTENSIBLE *)fmt)->SubFormat,
+                         &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+        params->result = is_float ? AUDCLNT_E_UNSUPPORTED_FORMAT : S_OK;
     }
 
     TRACE("is_format_supported: share=%d tag=%#x ch=%u rate=%u bits=%u aafmt=%d -> %#x\n",
