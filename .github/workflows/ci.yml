@@ -53,6 +53,8 @@ jobs:
         run: |
           set -e
           cp -v driver/directaudio.c driver/Makefile.in wine/dlls/winedirectaudio.drv/
+          # da_relay_ring.h is #include'd by directaudio.c (relay PoC); ship it too.
+          if [ -f driver/da_relay_ring.h ]; then cp -v driver/da_relay_ring.h wine/dlls/winedirectaudio.drv/; fi
           # Integration deltas (configure.ac + mmdevapi default_list) already live in
           # the pinned proton-wine ref; nothing to patch here.
 
@@ -162,6 +164,16 @@ jobs:
           cp -v "$PE" "$SO" "$OUT/"
           "$STRIP" --strip-all "$OUT/winedirectaudio.drv" 2>/dev/null || true
           "$STRIP" --strip-all "$OUT/winedirectaudio.so"  2>/dev/null || true
+          # Build the relay helper (standalone Android arm64 executable) if present.
+          # It owns the AAudio stream out-of-process (relay PoC); ships beside the .so.
+          if [ -f "$GITHUB_WORKSPACE/driver/directaudio-relay.c" ]; then
+            NDKBIN="$HOME/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            "$NDKBIN/aarch64-linux-android28-clang" -O2 -Wall \
+              -I"$GITHUB_WORKSPACE/driver" \
+              "$GITHUB_WORKSPACE/driver/directaudio-relay.c" \
+              -o "$OUT/directaudio-relay" -laaudio -llog
+            "$STRIP" --strip-all "$OUT/directaudio-relay" 2>/dev/null || true
+          fi
           echo "--- artifacts (${{ matrix.label }}) ---"; ls -la "$OUT"
           file "$OUT"/* || true
 

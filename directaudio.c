@@ -33,9 +33,17 @@
 
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 
 /* Blank the API-availability annotation before including AAudio.h so the API-28
  * AAudioStreamBuilder_setUsage we weak-guard below is not emitted as a STRONG
@@ -68,6 +76,8 @@ extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuild
 #include "wine/unixlib.h"
 
 #include "../mmdevapi/unixlib.h"
+
+#include "da_relay_ring.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(directaudio);
 
@@ -258,6 +268,20 @@ struct directaudio_mixer
     int reopen_running;   /* a reopen worker thread is active */
     int reopen_redo;      /* a reopen was requested; consumed by the worker */
     unsigned int cb_count;
+
+    /* --- relay mode (PoC): AAudio output lives in a spawned helper process, not
+     * here, so its AudioFlinger/RT client can't stall the game's render threads
+     * (the in-process AAudio client black-screened GoW). The mixer still runs in
+     * this process; a plain (non-RT) pump thread sums voices into a shared memfd
+     * ring that the relay's AAudio callback drains. mx->aq stays NULL in this
+     * mode, so the in-process error/reopen machinery above is dormant. */
+    int             relay_up;
+    int             ring_fd;
+    struct da_ring *ring;
+    size_t          ring_size;
+    pid_t           relay_pid;
+    pthread_t       pump_th;
+    int             pump_quit;
 };
 
 static struct directaudio_mixer g_mixer = { PTHREAD_MUTEX_INITIALIZER };
@@ -607,17 +631,174 @@ static void *mixer_reopen_thread(void *user)
     return NULL;
 }
 
-/* open the shared output on the first voice, using that voice's env-derived config */
+/* ===================== relay mode (PoC) ==================================== */
+
+#define RELAY_CAP_FRAMES     4800   /* 100 ms ring capacity (headroom) */
+#define RELAY_TARGET_FRAMES   960   /* ~20 ms kept buffered = the latency knob */
+#define RELAY_CHUNK_FRAMES    240   /* max produced per pump top-up */
+
+/* Sum all playing voices into `out` (numFrames stereo). Same as mixer_cb's core
+ * but callable from the plain pump thread (no AAudio stream needed). */
+static void mix_frames(struct directaudio_mixer *mx, float *out, int32_t numFrames)
+{
+    int32_t i, n2 = numFrames * MIX_OUT_CHANNELS;
+
+    memset(out, 0, (size_t)n2 * sizeof(float));
+    pthread_mutex_lock(&mx->lock);
+    for (i = 0; i < mx->nvoices; i++)
+        mix_voice(mx->voices[i], out, numFrames);
+    pthread_mutex_unlock(&mx->lock);
+    for (i = 0; i < n2; i++)
+    {
+        if (out[i] > 1.0f) out[i] = 1.0f;
+        else if (out[i] < -1.0f) out[i] = -1.0f;
+    }
+}
+
+/* Locate the relay helper: it ships next to this unixlib .so in the Proton layer,
+ * so read our own mapped path from /proc/self/maps and swap the basename. Using
+ * the process's OWN view of the path keeps it correct under proot. */
+static int relay_find_path(char *buf, size_t buflen)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512];
+    int found = 0;
+
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        char *p = strstr(line, "winedirectaudio.so");
+        char *slash;
+        if (!p) continue;
+        p = strchr(line, '/');                 /* start of the path column */
+        if (!p) continue;
+        p[strcspn(p, "\n")] = 0;
+        slash = strrchr(p, '/');
+        if (!slash) continue;
+        *slash = 0;
+        if ((size_t)snprintf(buf, buflen, "%s/directaudio-relay", p) < buflen)
+            found = 1;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
+/* Plain (non-RT) producer: keep the shared ring topped up to ~RELAY_TARGET_FRAMES
+ * so the relay's AAudio callback always has data. Runs in the game process but is
+ * an ordinary timer thread (like winealsa's), NOT an AAudio/RT thread, so it does
+ * not contend with the game's render threads. */
+static void *relay_pump_thread(void *user)
+{
+    struct directaudio_mixer *mx = user;
+    struct da_ring *r = mx->ring;
+    float tmp[RELAY_CHUNK_FRAMES * MIX_OUT_CHANNELS];
+    uint32_t cap = r->cap_frames;
+
+    while (!__atomic_load_n(&mx->pump_quit, __ATOMIC_ACQUIRE))
+    {
+        uint32_t widx = __atomic_load_n(&r->widx, __ATOMIC_RELAXED);
+        uint32_t avail = widx - __atomic_load_n(&r->ridx, __ATOMIC_ACQUIRE);
+
+        while (avail < r->target_frames &&
+               !__atomic_load_n(&mx->pump_quit, __ATOMIC_ACQUIRE))
+        {
+            uint32_t need = r->target_frames - avail;
+            uint32_t n = need < RELAY_CHUNK_FRAMES ? need : RELAY_CHUNK_FRAMES;
+            uint32_t k;
+
+            mix_frames(mx, tmp, (int32_t)n);
+            for (k = 0; k < n; k++)
+            {
+                uint32_t slot = (widx + k) % cap;
+                r->data[2*slot]     = tmp[2*k];
+                r->data[2*slot + 1] = tmp[2*k + 1];
+            }
+            widx += n;
+            __atomic_store_n(&r->widx, widx, __ATOMIC_RELEASE);
+            avail = widx - __atomic_load_n(&r->ridx, __ATOMIC_ACQUIRE);
+        }
+
+        {
+            struct timespec ts = { 0, 3 * 1000 * 1000 };  /* 3 ms */
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+/* Set up the shared ring + spawn the relay helper + start the pump. Returns 0 on
+ * success. Called once, under mx->lock, on the first voice. */
+static int relay_start(struct directaudio_mixer *mx)
+{
+    char relay_path[512], fdbuf[16];
+    char *argv[3];
+    posix_spawn_file_actions_t fa;
+    extern char **environ;
+    int fd, rc;
+    pid_t pid;
+
+    fd = (int)syscall(SYS_memfd_create, "da_ring", 0);   /* NOT cloexec -> inherited */
+    if (fd < 0) { DA_LOG("relay: memfd_create failed (%d)", errno); return -1; }
+
+    mx->ring_size = sizeof(struct da_ring) +
+                    (size_t)RELAY_CAP_FRAMES * MIX_OUT_CHANNELS * sizeof(float);
+    if (ftruncate(fd, (off_t)mx->ring_size) != 0) { DA_LOG("relay: ftruncate failed"); close(fd); return -1; }
+
+    mx->ring = mmap(NULL, mx->ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mx->ring == MAP_FAILED) { DA_LOG("relay: mmap failed"); close(fd); return -1; }
+    memset(mx->ring, 0, sizeof(struct da_ring));
+    mx->ring->magic         = DA_RING_MAGIC;
+    mx->ring->cap_frames    = RELAY_CAP_FRAMES;
+    mx->ring->target_frames = RELAY_TARGET_FRAMES;
+    mx->ring->rate          = DA_RING_RATE;
+    mx->ring_fd = fd;
+
+    if (!relay_find_path(relay_path, sizeof(relay_path)))
+    {
+        DA_LOG("relay: could not locate directaudio-relay next to the .so");
+        munmap(mx->ring, mx->ring_size); close(fd); return -1;
+    }
+
+    snprintf(fdbuf, sizeof(fdbuf), "%d", fd);
+    argv[0] = relay_path; argv[1] = fdbuf; argv[2] = NULL;
+
+    posix_spawn_file_actions_init(&fa);   /* keep fd open across exec (no cloexec set) */
+    rc = posix_spawn(&pid, relay_path, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0)
+    {
+        DA_LOG("relay: posix_spawn(%s) failed rc=%d", relay_path, rc);
+        munmap(mx->ring, mx->ring_size); close(fd); return -1;
+    }
+    mx->relay_pid = pid;
+    DA_LOG("relay: spawned pid=%d path=%s cap=%d target=%d", pid, relay_path,
+           RELAY_CAP_FRAMES, RELAY_TARGET_FRAMES);
+
+    __atomic_store_n(&mx->pump_quit, 0, __ATOMIC_SEQ_CST);
+    if (pthread_create(&mx->pump_th, NULL, relay_pump_thread, mx) != 0)
+    {
+        DA_LOG("relay: pump thread create failed");
+        __atomic_store_n(&mx->ring->quit, 1, __ATOMIC_SEQ_CST);
+        munmap(mx->ring, mx->ring_size); close(fd); return -1;
+    }
+    mx->relay_up = 1;
+    return 0;
+}
+
+/* open the shared output on the first voice, using that voice's env-derived config.
+ * PoC: route through the out-of-process relay instead of an in-process AAudio
+ * stream. mx->aq stays NULL (in-process error/reopen path stays dormant). */
 static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
                                          const struct directaudio_stream *cfg)
 {
-    if (mx->aq)
+    if (mx->relay_up)
         return AAUDIO_OK;
     mx->perf = cfg->aa_perf;
     mx->adaptive = cfg->adaptive;
     mx->max_buf_frames = cfg->max_buf_frames;
     mx->target_buf_frames = cfg->target_buf_frames;
-    return mixer_open_stream(mx, &mx->aq);
+    return relay_start(mx) == 0 ? AAUDIO_OK : AAUDIO_ERROR_INTERNAL;
 }
 
 static aaudio_result_t mixer_add_voice(struct directaudio_mixer *mx, struct directaudio_stream *v)
