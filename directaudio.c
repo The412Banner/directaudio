@@ -613,7 +613,14 @@ static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
 {
     if (mx->aq)
         return AAUDIO_OK;
-    mx->perf = cfg->aa_perf;
+    /* EXPERIMENT (GoW render-stall hunt): FORCE normal-priority (NONE) regardless
+     * of env. The driver otherwise always runs LOW_LATENCY = a SCHED_FIFO real-time
+     * AAudio callback thread INSIDE the game process; winealsa/winepulse offload
+     * audio to a separate PulseAudio daemon (out-of-process, no in-process RT
+     * thread). Suspect: the in-process RT thread starves GoW's render thread on the
+     * Pocket FIT (black screen, audio fine). If GoW boots with NONE -> confirmed. */
+    mx->perf = AAUDIO_PERFORMANCE_MODE_NONE;
+    (void)cfg->aa_perf;
     mx->adaptive = cfg->adaptive;
     mx->max_buf_frames = cfg->max_buf_frames;
     mx->target_buf_frames = cfg->target_buf_frames;
