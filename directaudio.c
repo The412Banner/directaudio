@@ -128,6 +128,62 @@ static NTSTATUS unix_not_implemented(void *args)
     return STATUS_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------------
+ * MIDI driver delegation. THIS IS LOAD-BEARING - do not "simplify" it back to a
+ * not-implemented stub.
+ *
+ * mmdevapi picks the MIDI driver in init_driver() (dlls/mmdevapi/main.c):
+ *
+ *     midi_drvname[0] = 0;
+ *     wine_unix_call( midi_get_driver, midi_drvname );
+ *     if (midi_drvname[0]) load_driver( midi_drvname, &midi_driver );
+ *     else                 midi_driver = drvs;      <-- US
+ *
+ * With midi_get_driver stubbed, midi_drvname stays empty and DirectAudio becomes
+ * its OWN MIDI driver. DriverProc(DRV_LOAD) then calls midi_init (also stubbed,
+ * so `err` keeps its pre-set DRV_SUCCESS) and spawns notify_thread():
+ *
+ *     while (1) {
+ *         MIDI_CALL( midi_notify_wait, &params );
+ *         if (quit) break;                          <-- `quit` is UNINITIALISED
+ *         if (notify.send_notify) notify_client(&notify);
+ *     }
+ *
+ * midi_notify_wait is contractually BLOCKING (winealsa's alsa_midi_notify_wait
+ * waits on a real event and sets *quit on shutdown). A stub that returns
+ * STATUS_SUCCESS immediately and never writes *quit turns that into a TIGHT
+ * INFINITE LOOP: one core pegged forever, hammering the PE->Unix boundary.
+ *
+ * DEVICE-PROVEN 2026-08-13: this is what black-screened God of War on
+ * DirectAudio while audio played perfectly. The spinning thread showed up as
+ * `mmdevapi_midi_n` holding 34079 of the process's 34314 utime jiffies - which
+ * is exactly the "0 fps / GPU 0% / CPU 17%" signature (one pegged core of eight)
+ * that was previously misread as "the main thread is deadlocked". It had nothing
+ * to do with AAudio, which is why moving AAudio out of process never helped.
+ *
+ * Fix = do what winepulse.drv does: delegate MIDI to winealsa.drv, which has a
+ * real blocking implementation. If winealsa fails to load, mmdevapi leaves
+ * midi_driver zeroed and DriverProc returns early - no thread, no spin. Safe
+ * either way. */
+static NTSTATUS unix_midi_get_driver(void *args)
+{
+    static const WCHAR driver[] = {'a','l','s','a',0};
+
+    memcpy(args, driver, sizeof(driver));
+    return STATUS_SUCCESS;
+}
+
+/* Defence in depth: if DirectAudio ever does end up as the MIDI driver anyway,
+ * exit the notify loop on the first iteration instead of spinning forever. */
+static NTSTATUS unix_midi_notify_wait(void *args)
+{
+    struct midi_notify_wait_params *params = args;
+
+    if (params->quit) *params->quit = TRUE;
+    if (params->notify) params->notify->send_notify = FALSE;
+    return STATUS_SUCCESS;
+}
+
 /* We provide no MIDI backend, but mmdevapi's midMessage/modMessage leave the
  * notify_context on the stack UNINITIALISED and fire notify_client() whenever
  * notify->send_notify is non-zero. A plain not-implemented stub never clears it,
@@ -1495,12 +1551,12 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     unix_test_connect,
     unix_is_started,
     unix_get_prop_value,
-    unix_not_implemented,        /* midi_get_driver */
+    unix_midi_get_driver,        /* midi_get_driver */
     unix_not_implemented,        /* midi_init */
     unix_not_implemented,        /* midi_release */
     unix_midi_out_message,       /* midi_out_message */
     unix_midi_in_message,        /* midi_in_message */
-    unix_not_implemented,        /* midi_notify_wait */
+    unix_midi_notify_wait,       /* midi_notify_wait */
     unix_not_implemented,        /* aux_message */
 };
 
@@ -1985,12 +2041,12 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     unix_wow64_test_connect,
     unix_is_started,
     unix_wow64_get_prop_value,
-    unix_not_implemented,        /* midi_get_driver */
+    unix_midi_get_driver,        /* midi_get_driver */
     unix_not_implemented,        /* midi_init */
     unix_not_implemented,        /* midi_release */
     unix_midi_out_message,       /* midi_out_message */
     unix_midi_in_message,        /* midi_in_message */
-    unix_not_implemented,        /* midi_notify_wait */
+    unix_midi_notify_wait,       /* midi_notify_wait */
     unix_not_implemented,        /* aux_message */
 };
 
