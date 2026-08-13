@@ -51,6 +51,14 @@ static aaudio_data_callback_result_t relay_cb(AAudioStream *s, void *user,
     for (; i < (uint32_t)numFrames; i++) { out[2*i] = 0.0f; out[2*i + 1] = 0.0f; }
 
     __atomic_store_n(&r->ridx, ridx + n, __ATOMIC_RELEASE);
+
+    /* heartbeat every ~200 callbacks: confirms data is flowing + underrun rate */
+    {
+        static uint32_t cb, under;
+        if (n < (uint32_t)numFrames) under++;
+        if (!(++cb % 200))
+            RLOG("hb: cb=%u under=%u avail=%u read=%u", cb, under, avail, n);
+    }
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -86,7 +94,10 @@ int main(int argc, char **argv)
     AAudioStreamBuilder_setSampleRate(builder, DA_RING_RATE);
     AAudioStreamBuilder_setChannelCount(builder, DA_RING_CHANNELS);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    /* PoC step: NONE = normal-priority audio thread. LOW_LATENCY opens a
+     * SCHED_FIFO real-time thread that preempts the game's render thread even
+     * from a separate process; test whether dropping to NONE lets GoW render. */
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
     AAudioStreamBuilder_setDataCallback(builder, relay_cb, NULL);
 
     r = AAudioStreamBuilder_openStream(builder, &stream);
