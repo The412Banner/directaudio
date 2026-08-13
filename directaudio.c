@@ -45,6 +45,28 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
+/* ---------------------------------------------------------------------------
+ * GoW EXPERIMENT BRANCH — DA_RELAY_ONLY
+ *
+ * Hypothesis (a): GoW's main thread deadlocks whenever an AAudio/AudioFlinger
+ * client exists in the GAME's process, because libaaudio pulls in libbinder and
+ * spawns threads via raw pthread_create that Wine does not manage. (Wine's own
+ * winepulse.drv refuses to use pa_threaded_mainloop for exactly this reason —
+ * see dlls/winepulse.drv/pulse.c, "it uses pthread_create() directly".)
+ *
+ * The earlier relay PoC did NOT test this: it moved the output STREAM into the
+ * helper process, but libaaudio was still DT_NEEDED by this unixlib and
+ * unix_test_connect still called AAudio_createStreamBuilder() in the game's
+ * process at driver-selection time.
+ *
+ * With DA_RELAY_ONLY the in-process mixer/AAudio paths are compiled out and
+ * -laaudio is dropped from Makefile.in, so ALL AAudio contact lives in the
+ * directaudio-relay helper. Because the library is no longer linked, any
+ * remaining in-process AAudio reference is a LINK ERROR — a green build is
+ * itself the proof that the game process is AAudio-free.
+ * ------------------------------------------------------------------------- */
+#define DA_RELAY_ONLY 1
+
 /* Blank the API-availability annotation before including AAudio.h so the API-28
  * AAudioStreamBuilder_setUsage we weak-guard below is not emitted as a STRONG
  * undefined symbol: this unixlib is linked -z now, so a strong ref to a symbol
@@ -59,8 +81,10 @@
 /* setUsage is API 28+. Redeclared weak so the linker leaves its address NULL on
  * older libaaudio instead of failing dlopen; the guard in mixer_open_stream only
  * calls it when present AND api_level >= 28 (per GN review). */
+#ifndef DA_RELAY_ONLY
 extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuilder *builder,
                                                                aaudio_usage_t usage);
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -402,6 +426,7 @@ static void mix_voice(struct directaudio_stream *v, float *out, int32_t numFrame
     pthread_mutex_unlock(&v->lock);
 }
 
+#ifndef DA_RELAY_ONLY
 /* AAudio pulls from the single mixed output on its high-priority audio thread. */
 static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
                                               void *audioData, int32_t numFrames)
@@ -630,6 +655,7 @@ static void *mixer_reopen_thread(void *user)
     }
     return NULL;
 }
+#endif /* !DA_RELAY_ONLY */
 
 /* ===================== relay mode (PoC) ==================================== */
 
@@ -893,6 +919,14 @@ static NTSTATUS unix_main_loop(void *args)
 static NTSTATUS unix_test_connect(void *args)
 {
     struct test_connect_params *params = args;
+#ifdef DA_RELAY_ONLY
+    /* GoW experiment: do NOT touch AAudio here. This probe ran in the GAME's
+     * process at driver-selection time, before any stream existed, so the
+     * relay PoC never actually removed AAudio from the game process — it only
+     * moved the output stream out. Availability is now proven by the relay
+     * helper starting instead (mixer_ensure_open -> relay_start). */
+    params->priority = Priority_Preferred;
+#else
     AAudioStreamBuilder *builder = NULL;
 
     if (AAudio_createStreamBuilder(&builder) == AAUDIO_OK && builder)
@@ -902,6 +936,7 @@ static NTSTATUS unix_test_connect(void *args)
     }
     else
         params->priority = Priority_Unavailable;
+#endif
 
     return STATUS_SUCCESS;
 }
@@ -1269,7 +1304,13 @@ static NTSTATUS unix_get_latency(void *args)
     int32_t buf_frames;
 
     pthread_mutex_lock(&stream->lock);
+#ifdef DA_RELAY_ONLY
+    /* relay mode: no in-process AAudio stream exists, so there is nothing to
+     * query. The relay's own buffering is fixed at RELAY_TARGET_FRAMES. */
+    buf_frames = RELAY_TARGET_FRAMES;
+#else
     buf_frames = g_mixer.aq ? AAudioStream_getBufferSizeInFrames(g_mixer.aq) : 0;
+#endif
     if (buf_frames < 0) buf_frames = 0;
     /* pretend we process audio in Period chunks, so max latency includes it */
     *params->latency = muldiv(buf_frames, 10000000, stream->fmt->nSamplesPerSec) + stream->period;

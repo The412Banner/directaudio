@@ -2,7 +2,11 @@ MODULE    = winedirectaudio.drv
 UNIXLIB   = winedirectaudio.so
 IMPORTS   = uuid ole32 user32 advapi32
 DELAYIMPORTS = winmm
-UNIX_LIBS = $(AAUDIO_LIBS) $(PTHREAD_LIBS) -llog
+# GoW EXPERIMENT (DA_RELAY_ONLY): $(AAUDIO_LIBS) deliberately REMOVED so that
+# libaaudio is not DT_NEEDED by this unixlib and no AAudio client can exist in
+# the game's process. All AAudio contact lives in the directaudio-relay helper.
+# Any surviving in-process AAudio reference now fails the link on purpose.
+UNIX_LIBS = $(PTHREAD_LIBS) -llog
 
 SOURCES = \
 	directaudio.c
