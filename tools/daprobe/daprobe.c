@@ -14,8 +14,9 @@
  *                  TO. A game told "yes, 7.1" still hears whatever this says.
  *
  * Run it inside the container with the driver under test selected. Writes
- * daprobe.txt beside itself as well as printing, because a Wine console is not
- * always where you can read it.
+ * daprobe.txt NEXT TO THE EXE (not the working directory, which depends on how
+ * it was launched) as well as printing, because a Wine console is not always
+ * where you can read it. The resolved path is printed, so there is no hunting.
  *
  * Build: x86_64 PE (runs under FEX/box64 in any container).
  */
@@ -27,8 +28,38 @@
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <stdio.h>
+#include <string.h>
 
 static FILE *g_out;
+static char g_out_path[MAX_PATH * 2];
+
+/* Beside the EXE, deliberately: the working directory depends on how the program
+ * was launched (a shortcut sets it to the game folder, a bare run may leave it at
+ * C:\\windows\\system32), and a report you have to go looking for is a report
+ * that gets lost. Falls back to the working directory if the module path cannot
+ * be resolved. */
+static void open_report(void)
+{
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char *slash;
+
+    if (n > 0 && n < MAX_PATH)
+    {
+        slash = strrchr(path, '\\');
+        if (slash)
+        {
+            *(slash + 1) = 0;
+            snprintf(g_out_path, sizeof(g_out_path), "%sdaprobe.txt", path);
+            g_out = fopen(g_out_path, "w");
+        }
+    }
+    if (!g_out)
+    {
+        snprintf(g_out_path, sizeof(g_out_path), "daprobe.txt (working directory)");
+        g_out = fopen("daprobe.txt", "w");
+    }
+}
 
 static void emit(const char *fmt, ...)
 {
@@ -205,7 +236,7 @@ int main(void)
     IMMDeviceEnumerator *en = NULL;
     HRESULT hr;
 
-    g_out = fopen("daprobe.txt", "w");
+    open_report();
 
     emit("daprobe - audio capability report\n");
     emit("=================================\n");
@@ -225,7 +256,7 @@ int main(void)
     IMMDeviceEnumerator_Release(en);
     CoUninitialize();
 
-    emit("\nwritten to daprobe.txt\n");
+    emit("\nwritten to %s\n", g_out_path);
     if (g_out) fclose(g_out);
     return 0;
 }
