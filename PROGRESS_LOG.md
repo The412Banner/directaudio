@@ -128,3 +128,82 @@ Files restored, hashes verified against baseline.
 2. Downmix headroom (5.1 fold peaks ~2.41x full scale -> clips), route rate/burst
    re-derive, Spatializer/multichannel, mic capture. See the feature roadmap.
 3. Mali GPUs still untested. Everything above is one device (Adreno 750 / Android 14).
+
+---
+
+## 2026-08-13 (later) — v1.2.1 SHIPPED. Dead AAudio data callback -> permanent audio loss.
+
+Downstream bug report (JT, GameNative): "rapidly pause/resume the game and audio is
+lost forever until you reopen it." Reproduced here on Bannerlator with v1.2, so it is
+**driver-side, not app-specific**.
+
+### Correction to the report
+The trigger is **rapid BACKGROUND/FOREGROUND of the app**, not pause/resume. The
+in-drawer Pause/Resume (`SIGSTOP`/`SIGCONT` on the guest) does NOT reproduce it. Rapid
+bg/fg does, every time. (GameNative's "pause" may simply be backgrounding.)
+
+### Root cause
+Backgrounding freezes the guest, so it cannot feed the mixer and the in-process AAudio
+stream starves. AudioTrack eventually disables itself and auto-restarts, but the data
+callback never resumes:
+
+```
+19:50:20  hb: cb=19000 buf=5568(116ms) xruns=28    <-- last heartbeat ever
+19:50:23  W AudioTrack: restartIfDisabled(263): releaseBuffer() track
+          disabled due to previous underrun, restarting
+          -- data callback never fires again --
+19:50:36+ pad=1536 held=1536 playing=1             guest ring full, frozen
+```
+
+AudioFlinger agrees independently: track frames climb 576 -> 5760, underruns hit
+442176, then the track goes ABSENT. This raises **no error**, so `mixer_error_cb` --
+the only path that rebuilt the stream -- never runs.
+
+### Three defects, all fixed (`de24081`, `7b9afff`)
+1. **No stall detection.** `mixer_watchdog()`, called once per period from
+   `unix_timer_loop` (which keeps ticking when audio is dead). Callback silent 1 s with
+   voices playing -> rebuild via the existing reopen worker. A disabled AAudio stream
+   can never be restarted; recreate is the only recovery, same as a route change.
+2. **`cb_count` never advanced.** It was incremented INSIDE the `TRACE_ON()` test, so
+   short-circuit meant it never ran with tracing off -- a dead callback looked identical
+   to a live one. Now unconditional; this is what makes the watchdog work in RELEASE.
+3. **Adaptive inflated on suspension.** Frozen guest -> xruns climb anyway -> monotonic
+   growth -> permanent inflation (192 -> 5568 fr, 4 ms -> 116 ms). Now re-baselines on a
+   gap > 500 ms instead of growing.
+
+The watchdog **re-baselines rather than trips** when its OWN cadence jumps, so a normal
+bg/fg cycle does not force a needless rebuild.
+
+### Also: rebuilds are now visible in the RELEASE build
+`mixer_request_reopen` only logged via Wine `WARN()` (needs WINEDEBUG, goes to stderr),
+so a rebuild was invisible in logcat and unattributable. Added `DA_EVENT` (always on,
+event-level only -- a few lines per session, not telemetry):
+`I DirectAudio: reopen: data callback stalled` / `reopen: stream error`.
+Needs `-llog` in `UNIX_LIBS`. Heartbeats/per-call tracing stay in the diagnostics build.
+
+### Verified BOTH directions on device (DiRT 3)
+**Recovers** (abuse run): heartbeats unbroken cb=1000->21000 (was: stop at 19000
+forever); ring draining 199/1344/1/177 (was: pinned 1536); buffer resets to 192 fr
+(4 ms) each rebuild (was: 5568 fr / 116 ms, never shrinks); 5 rebuilds, every old stream
+closed 4->9->11->12 (no leak); **user heard NO dropout at all**. Inaudible because the
+swap is ~77 ms and the new stream is promoted BEFORE the old is destroyed, so the guest
+ring covers it.
+
+**Does not misfire** (5 min clean gameplay, no backgrounding): `reopen:` events = **0**;
+stream opens = **1**; buffer **384 fr / 8.00 ms flat** the whole session; xruns = **1**
+(at startup); 77,000 callbacks. This also confirms defect 3 retroactively -- the growth
+in the abuse run came from freezing, not from the game being hard to feed.
+
+### Release
+`directaudio-v1.2.1` -- 4 assets: `-sdk28/35` (release) and `-diagnostics-sdk28/35`.
+Device restored to the shipped release driver (`9817a941`).
+
+### Open
+1. **SHIPPING GAP (biggest):** `proton_11.0` does not carry `dlls/winedirectaudio.drv`
+   at all, its `mmdevapi` `default_list` has no `directaudio`, and the submodule pin on
+   `feat/directaudio-submodule` is STALE at `cd6b4a3`. A Proton rebuild today ships
+   neither v1.2 nor v1.2.1 -- everything on device is hot-swapped.
+2. Preset rework: default `stable`->`auto`; add "Minimum" (`bf=192, adaptive=true`);
+   **NEVER `bf=192` on `low`** (it has `adaptive=false`).
+3. Downmix headroom, route rate/burst re-derive, Spatializer, mic capture.
+4. Mali untested. Ninja Gaiden untested. Upstream to GameNative needs a NEW PR (#7 merged).
