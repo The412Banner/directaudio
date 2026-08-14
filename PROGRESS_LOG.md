@@ -298,3 +298,48 @@ Floor discovery logs via `DA_EVENT`; individual steps are TRACE only.
   latency" box is honest given ~21 ms of the measured 25 ms is AudioFlinger's
   output latency, which the driver does not control).
 - Not merged, not tagged, not in any Proton layer.
+
+## 2026-08-14 (later) — full env control: ms latency + 9 more knobs (same branch)
+
+`dfa2cb7` (ms) + `401bf36` (the nine). Same branch `feat/adaptive-decay`, still
+unmerged and still untested on device.
+
+### Millisecond latency, with no UI
+`_MS` / `_MAXMS` mirror `_BF` / `_MBF` in milliseconds and are read LAST so they
+win. That precedence is load-bearing: `applyDirectAudioConfig` writes `_BF` into
+the env from the selected preset on EVERY launch, so a hand-typed frame count
+loses to the preset every time. Nothing but a person sets `_MS`.
+
+ms->frames conversion happens AFTER open, not at config read, because it needs
+the device burst. Rounds UP to a burst multiple (never below one burst): asking
+5 ms on a 4 ms-burst device gives 8 ms. Rounding down under-serves a burst and
+underruns; not rounding leaves decay chasing a size the stream cannot hold.
+
+`_MS` is also the decay floor, so "target a latency and adapt around it" is now
+literally true rather than aspirational.
+
+### The nine
+| knob | was | why it matters |
+|---|---|---|
+| `_PERIOD_MS` / `_MINPERIOD_MS` | `def_period` 10 ms / `min_period` 5 ms, compiled in | **the guest half of latency** - `get_latency` = buffer + period, and games size their buffers from the reported period. Every other knob steered only the AAudio half. Read at process attach: `get_device_period` is asked before any stream exists. min clamped to def (WASAPI contract). |
+| `_EXCLUSIVE` | sharing mode hardcoded SHARED | never-tested lever; EXCLUSIVE can go lower where granted, AAudio falls back silently - hence the open log now reports GRANTED perf + sharing, not requested |
+| `_WATCHDOG` / `_STALL_MS` | watchdog always on, 1 s | could not be A/B'd or its off state tested |
+| `_DECAY_QUIET_MS` / `_DECAY_PUNISH_MS` / `_DECAY_MAXBACKOFF` | 10 s / 5 s / 32x | all three were reasoned guesses; now tunable in one device session instead of five build cycles |
+| `_LOG` | diagnostics build only | heartbeats + growth + decay steps on a RELEASE build (`DA_LOG` = `DA_EVENT` behind the flag). Field diagnosis with no special binary. |
+
+Parsing rule: `<= 0` means "not set" and falls back to the built-in, so a
+malformed value can never request a 0 ms timeout or a zero-length buffer.
+`_WATCHDOG` is the exception (boolean, 0 is an answer).
+
+### Deliberately NOT exposed
+Mix format, output rate, channel count, AAudio usage tag, device pinning
+(`setDeviceId` is still never called), downmix gain, adaptive step size. Each
+changes what the driver DOES rather than how it is tuned, and each belongs to a
+roadmap item with its own device test.
+
+### Still open
+Device test for everything on this branch. The app also needs a plumbing fix:
+`persistAudioToShortcut` drops EVERY `BANNER_AUDIO_DIRECT_*` token and re-emits
+only the six keys it knows, so hand-typed `_MS`/`_MAXMS`/`_DECAY` survive
+launches but are silently deleted the first time the in-game audio cog is
+applied. Fix = drop only the keys being rewritten.
