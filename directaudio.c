@@ -765,7 +765,15 @@ static void da_apply_runtime_overrides(struct directaudio_mixer *mx)
 {
     if (da_rt_ms   >= 0) { mx->target_ms = da_rt_ms; mx->target_buf_frames = 0; }
     if (da_rt_maxms > 0)   mx->max_buf_frames = da_rt_maxms * MIX_OUT_RATE / 1000;
-    if (da_rt_perf >= 0)   mx->perf = da_rt_perf;
+    /* PERF is 0/1/2 in the file but an AAudio ENUM (NONE=10 / POWER_SAVING=11 /
+     * LOW_LATENCY=12) on the stream - map it exactly as read_config_from_env does.
+     * Setting the raw 0/1/2 opens the stream with an INVALID performance mode, which
+     * stalls the data callback: DEVICE-PROVEN 2026-08-14 a `PERF=0` mailbox write set
+     * perf=0 and every reopen after it stalled -> watchdog reopen loop -> dead audio. */
+    if      (da_rt_perf == 0) mx->perf = AAUDIO_PERFORMANCE_MODE_NONE;
+    else if (da_rt_perf == 1) mx->perf = AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
+    else if (da_rt_perf == 2) mx->perf = AAUDIO_PERFORMANCE_MODE_POWER_SAVING;
+    /* da_rt_perf == -1: unset, keep the launch perf */
 }
 
 /* Parse the KEY=VALUE mailbox file into the override globals. Values <=0 (or out
@@ -777,6 +785,10 @@ static void da_read_runtime_file(void)
     char line[128];
 
     if (!da_rt_path[0] || !(f = fopen(da_rt_path, "r"))) return;
+    /* Reset on every successful read so a key ABSENT from the file reverts to the
+     * launch config, rather than a stale override persisting (e.g. a later MS-only
+     * write must drop a previous PERF, not keep applying it on every reopen). */
+    da_rt_ms = da_rt_maxms = da_rt_perf = -1;
     while (fgets(line, sizeof(line), f))
     {
         char *eq = strchr(line, '=');
