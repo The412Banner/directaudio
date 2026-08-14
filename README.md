@@ -127,6 +127,22 @@ Read from the environment at stream open:
 | `BANNER_AUDIO_DIRECT_MBF` | cap for adaptive growth (`0` = device capacity) |
 | `BANNER_AUDIO_DIRECT_MS` | initial buffer in **milliseconds** — wins over `_BF` |
 | `BANNER_AUDIO_DIRECT_MAXMS` | growth ceiling in **milliseconds** — wins over `_MBF` |
+| `BANNER_AUDIO_DIRECT_PERIOD_MS` | device period reported to the guest *(default 10)* |
+| `BANNER_AUDIO_DIRECT_MINPERIOD_MS` | minimum period reported to the guest *(default 5)* |
+| `BANNER_AUDIO_DIRECT_EXCLUSIVE` | `1` request an EXCLUSIVE AAudio stream · `0` SHARED *(default)* |
+| `BANNER_AUDIO_DIRECT_WATCHDOG` | `1` dead-callback watchdog *(default)* · `0` off |
+| `BANNER_AUDIO_DIRECT_STALL_MS` | callback silence before a rebuild *(default 1000)* |
+| `BANNER_AUDIO_DIRECT_DECAY_QUIET_MS` | calm required before a step down *(default 10000)* |
+| `BANNER_AUDIO_DIRECT_DECAY_PUNISH_MS` | window in which an underrun blames the last step *(default 5000)* |
+| `BANNER_AUDIO_DIRECT_DECAY_MAXBACKOFF` | cap on the quiet-period multiplier *(default 32)* |
+| `BANNER_AUDIO_DIRECT_LOG` | `1` verbose logcat on a **release** build *(default 0)* |
+
+Everything is read once — the per-stream knobs at stream open, the period,
+watchdog, decay and log settings at process attach (the guest asks for the
+device period before it creates anything). Values of `0` or less are ignored
+rather than honoured, so a malformed value falls back to the built-in instead of
+requesting something degenerate. `_WATCHDOG` is the exception: it is a boolean,
+where `0` is a real answer.
 
 #### Setting latency by hand, with no UI
 
@@ -159,6 +175,38 @@ DirectAudio: open: buffer 384 frames (8 ms) burst 192 cap 12000 - device adds it
 ```
 
 `adb logcat -s DirectAudio` shows it, on a release build, with no tracing enabled.
+
+#### The other half of the latency
+
+The buffer knobs above size the **AAudio** side. The **guest** side is the device
+period — `get_latency` returns buffer + period, and games size their own buffers
+from the period the driver reports. It defaults to 10 ms and is now settable:
+
+```
+BANNER_AUDIO_DIRECT_PERIOD_MS=5 BANNER_AUDIO_DIRECT_MINPERIOD_MS=5
+```
+
+Lowering it makes the guest write smaller chunks more often. That is a real
+latency win and a real CPU cost, and under box64/FEX the cost is not small —
+treat it as a per-title experiment, not a default. The minimum is clamped to the
+default if you set them inconsistently, since WASAPI does not allow the minimum
+period to exceed the default one.
+
+#### Diagnosing without a special build
+
+`BANNER_AUDIO_DIRECT_LOG=1` turns on heartbeats plus buffer growth and decay
+steps in a **release** build, tagged `DirectAudio` in logcat. The diagnostics
+build is still the place for per-call tracing, but a field report no longer
+requires shipping someone a different binary to find out what the buffer did.
+
+The remaining tunables exist for the same reason — every one of them was a
+number compiled into the driver, which meant testing a different value cost a
+CI build. `_STALL_MS`, `_DECAY_QUIET_MS`, `_DECAY_PUNISH_MS` and
+`_DECAY_MAXBACKOFF` move the watchdog and decay timings; `_WATCHDOG=0` takes the
+watchdog out of the picture entirely when something needs to be A/B'd against
+it. `_EXCLUSIVE=1` asks AAudio for an exclusive stream, which can reach a lower
+floor on hardware that grants it — AAudio quietly falls back to shared where it
+cannot, so check the open log for what you actually got.
 
 ---
 

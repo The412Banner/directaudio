@@ -97,6 +97,7 @@ struct directaudio_stream
     aaudio_format_t aa_format;
     int32_t aa_channels, aa_rate;
     aaudio_performance_mode_t aa_perf;
+    aaudio_sharing_mode_t aa_share;
 
     /* adaptive buffer control (ported from the ALSA/PA adaptive stacks) */
     BOOL adaptive;
@@ -122,8 +123,13 @@ struct directaudio_stream
     unsigned int cb_count;
 };
 
-static const REFERENCE_TIME def_period = 100000;
-static const REFERENCE_TIME min_period = 50000;
+/* The device period reported to the guest. NOT const: it is half of the latency
+ * the guest sees (get_latency returns buffer + period) and games size their own
+ * buffers from it, so it is env-tunable via BANNER_AUDIO_DIRECT_PERIOD_MS. Read
+ * once at process attach - get_device_period is asked before any stream exists,
+ * so this cannot live in the per-stream config. */
+static REFERENCE_TIME def_period = 100000;   /* 10 ms in 100 ns units */
+static REFERENCE_TIME min_period = 50000;    /*  5 ms */
 
 static ULONG_PTR zero_bits = 0;
 
@@ -305,6 +311,7 @@ struct directaudio_mixer
     struct directaudio_stream *voices[MIX_MAX_VOICES];
     int nvoices;
     aaudio_performance_mode_t perf;
+    aaudio_sharing_mode_t share;
     BOOL adaptive;
     BOOL decay;
     int32_t max_buf_frames, target_buf_frames;
@@ -351,6 +358,22 @@ struct directaudio_mixer
 #define DA_DECAY_QUIET_NS  10000000000ull /* clean for this long => try one step down */
 #define DA_DECAY_PUNISH_NS  5000000000ull /* xrun this soon after a step => stepped too far */
 #define DA_DECAY_MAX_BACKOFF 32           /* caps the retry interval at ~5 min */
+
+/* Process-wide tuning, read once at attach (see read_global_config_from_env).
+ * These start at the constants above; every one of those numbers is a reasoned
+ * guess rather than a measurement, and being able to move them on a device
+ * turns a tuning question into one session instead of a build-test cycle. */
+static UINT64 da_stall_ns  = DA_CB_STALL_NS;
+static UINT64 da_quiet_ns  = DA_DECAY_QUIET_NS;
+static UINT64 da_punish_ns = DA_DECAY_PUNISH_NS;
+static unsigned int da_max_backoff = DA_DECAY_MAX_BACKOFF;
+static BOOL da_watchdog = TRUE;
+static int da_log = 0;
+
+/* Verbose logging in a RELEASE build. The diagnostics build stays the place for
+ * per-call tracing, but a field report should not require shipping someone a
+ * special binary to find out what the buffer is doing. Off unless asked. */
+#define DA_LOG(...) do { if (da_log) DA_EVENT(__VA_ARGS__); } while (0)
 
 static inline UINT64 da_now_ns(void)
 {
@@ -547,7 +570,7 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
              * attribution window is deliberately short; a mis-attributed spike
              * only costs some reclaim, never correctness. */
             if (mx->decay && mx->last_decay_ns &&
-                now - mx->last_decay_ns < DA_DECAY_PUNISH_NS)
+                now - mx->last_decay_ns < da_punish_ns)
             {
                 if (want > mx->decay_floor)
                 {
@@ -555,8 +578,9 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
                     DA_EVENT("decay floor: %d frames (%d ms) - not probing below it",
                              want, want * 1000 / MIX_OUT_RATE);
                 }
-                if (mx->decay_backoff < DA_DECAY_MAX_BACKOFF) mx->decay_backoff *= 2;
+                if (mx->decay_backoff < da_max_backoff) mx->decay_backoff *= 2;
             }
+            else DA_LOG("grow: buf %d -> %d frames (xruns %d)", cur, want, xruns);
             mx->last_xrun = xruns;
             mx->last_xrun_ns = now;
         }
@@ -567,7 +591,7 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
              * open-time size (which honours BANNER_AUDIO_DIRECT_BF), raised by any
              * level already proven unsustainable: decay only ever undoes growth,
              * it never probes below the latency the launch config asked for. */
-            UINT64 quiet = DA_DECAY_QUIET_NS * mx->decay_backoff;
+            UINT64 quiet = da_quiet_ns * mx->decay_backoff;
             int32_t floor = mx->base_buf_frames;
 
             if (mx->decay_floor > floor) floor = mx->decay_floor;
@@ -582,6 +606,7 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
                     AAudioStream_setBufferSizeInFrames(aq, want);
                     mx->last_decay_ns = now;
                     TRACE("decay: buf %d -> %d frames (floor %d)\n", cur, want, floor);
+                    DA_LOG("decay: buf %d -> %d frames (floor %d)", cur, want, floor);
                 }
             }
         }
@@ -591,6 +616,11 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         TRACE("mix hb: cb=%u voices=%d buf=%d cap=%d xruns=%d\n", mx->cb_count, mx->nvoices,
               AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
               AAudioStream_getXRunCount(aq));
+
+    if (da_log && !(mx->cb_count % 1000))
+        DA_EVENT("hb: cb=%u voices=%d buf=%d cap=%d xruns=%d", mx->cb_count, mx->nvoices,
+                 AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
+                 AAudioStream_getXRunCount(aq));
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -657,7 +687,11 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
         return r != AAUDIO_OK ? r : AAUDIO_ERROR_NO_MEMORY;
 
     AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
-    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    /* SHARED unless asked otherwise. EXCLUSIVE can reach a lower floor on devices
+     * that grant it, and AAudio silently falls back to SHARED where it cannot -
+     * which is exactly why the open log below reports what was actually granted
+     * rather than what was requested. */
+    AAudioStreamBuilder_setSharingMode(builder, mx->share);
     AAudioStreamBuilder_setPerformanceMode(builder, mx->perf);
     /* API 28+ only: the weak ref (declared near the AAudio.h include) stays NULL
      * on older libaaudio so the .so still loads; tag output as game audio so
@@ -727,9 +761,12 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
      * what the device actually granted instead of guessing. The buffer is the
      * part we control; AudioFlinger adds its own output latency on top (~21 ms on
      * the reference device), which is why this says "buffer" and not "latency". */
-    DA_EVENT("open: buffer %d frames (%d ms) burst %d cap %d - device adds its own output latency",
+    DA_EVENT("open: buffer %d frames (%d ms) burst %d cap %d perf %d sharing %d period %d ms"
+             " - device adds its own output latency",
              mx->base_buf_frames, mx->base_buf_frames * 1000 / MIX_OUT_RATE,
-             AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferCapacityInFrames(aq));
+             AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferCapacityInFrames(aq),
+             AAudioStream_getPerformanceMode(aq), AAudioStream_getSharingMode(aq),
+             (int)(def_period / 10000));
 
     r = AAudioStream_requestStart(aq);
     if (r != AAUDIO_OK)
@@ -811,6 +848,7 @@ static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
     if (mx->aq)
         return AAUDIO_OK;
     mx->perf = cfg->aa_perf;
+    mx->share = cfg->aa_share;
     mx->adaptive = cfg->adaptive;
     mx->decay = cfg->decay;
     mx->max_buf_frames = cfg->max_buf_frames;
@@ -874,6 +912,7 @@ static void read_config_from_env(struct directaudio_stream *stream)
      * BANNER_AUDIO_DIRECT_PERF still overrides below; buffers stay small - big
      * buffers are incompatible with the low-latency fast path.) */
     stream->aa_perf = AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
+    stream->aa_share = AAUDIO_SHARING_MODE_SHARED;
     stream->adaptive = TRUE;
     /* Decay defaults ON. It cannot make the buffer smaller than the launch config
      * asked for, so the worst it can do is hand back latency that growth took -
@@ -906,6 +945,62 @@ static void read_config_from_env(struct directaudio_stream *stream)
      * zero-length buffer. */
     if ((e = getenv("BANNER_AUDIO_DIRECT_MS")) && atoi(e) > 0) stream->target_ms = atoi(e);
     if ((e = getenv("BANNER_AUDIO_DIRECT_MAXMS")) && atoi(e) > 0) stream->max_ms = atoi(e);
+
+    if ((e = getenv("BANNER_AUDIO_DIRECT_EXCLUSIVE")) && atoi(e) != 0)
+        stream->aa_share = AAUDIO_SHARING_MODE_EXCLUSIVE;
+}
+
+/* A positive integer from the environment, else the existing value. Zero and
+ * negative are treated as "not set" so an empty or malformed string falls back
+ * to the built-in rather than to something degenerate like a 0 ms timeout. */
+static int env_pos(const char *name, int fallback)
+{
+    const char *e = getenv(name);
+    int v;
+
+    if (!e || !*e) return fallback;
+    v = atoi(e);
+    return v > 0 ? v : fallback;
+}
+
+/* Process-wide tuning, read once at DLL attach rather than per stream: the guest
+ * asks for the device period before it creates anything, and the watchdog/decay
+ * timings belong to the single shared mixer. Every value here is a number chosen
+ * by reasoning; being able to move it on a device is what makes it testable. */
+static void read_global_config_from_env(void)
+{
+    int ms;
+
+    if ((ms = env_pos("BANNER_AUDIO_DIRECT_PERIOD_MS", 0)) > 0)
+        def_period = (REFERENCE_TIME)ms * 10000;
+    if ((ms = env_pos("BANNER_AUDIO_DIRECT_MINPERIOD_MS", 0)) > 0)
+        min_period = (REFERENCE_TIME)ms * 10000;
+    /* WASAPI's contract: the minimum period cannot exceed the default one. A
+     * caller who sets only one of the pair must not be able to invert them. */
+    if (min_period > def_period) min_period = def_period;
+
+    {
+        /* Boolean, so unlike the rest a literal 0 is meaningful and must not be
+         * treated as "unset" - hence the explicit read instead of env_pos. */
+        const char *e = getenv("BANNER_AUDIO_DIRECT_WATCHDOG");
+        if (e && *e) da_watchdog = atoi(e) != 0;
+    }
+    if ((ms = env_pos("BANNER_AUDIO_DIRECT_STALL_MS", 0)) > 0)
+        da_stall_ns = (UINT64)ms * 1000000ull;
+    if ((ms = env_pos("BANNER_AUDIO_DIRECT_DECAY_QUIET_MS", 0)) > 0)
+        da_quiet_ns = (UINT64)ms * 1000000ull;
+    if ((ms = env_pos("BANNER_AUDIO_DIRECT_DECAY_PUNISH_MS", 0)) > 0)
+        da_punish_ns = (UINT64)ms * 1000000ull;
+    if ((ms = env_pos("BANNER_AUDIO_DIRECT_DECAY_MAXBACKOFF", 0)) > 0)
+        da_max_backoff = (unsigned int)ms;
+
+    da_log = env_pos("BANNER_AUDIO_DIRECT_LOG", 0);
+
+    DA_LOG("config: period %d ms min %d ms watchdog %d stall %d ms quiet %d ms"
+           " punish %d ms maxbackoff %u",
+           (int)(def_period / 10000), (int)(min_period / 10000), da_watchdog,
+           (int)(da_stall_ns / 1000000), (int)(da_quiet_ns / 1000000),
+           (int)(da_punish_ns / 1000000), da_max_backoff);
 }
 
 static NTSTATUS unix_process_attach(void *args)
@@ -919,6 +1014,7 @@ static NTSTATUS unix_process_attach(void *args)
         zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
     }
 #endif
+    read_global_config_from_env();
     return STATUS_SUCCESS;
 }
 
@@ -1393,6 +1489,7 @@ static void mixer_watchdog(struct directaudio_mixer *mx)
     UINT64 now = da_now_ns(), last_cb, prev_tick;
     unsigned int cb;
 
+    if (!da_watchdog) return;                                  /* disabled by env */
     if (!__atomic_load_n(&mx->aq, __ATOMIC_SEQ_CST)) return;   /* no output open */
     if (!__atomic_load_n(&mx->nvoices, __ATOMIC_SEQ_CST)) return; /* nothing playing */
 
@@ -1417,9 +1514,9 @@ static void mixer_watchdog(struct directaudio_mixer *mx)
     }
 
     last_cb = __atomic_load_n(&mx->last_cb_ns, __ATOMIC_SEQ_CST);
-    if (!last_cb || now - last_cb < DA_CB_STALL_NS) return;
+    if (!last_cb || now - last_cb < da_stall_ns) return;
 
-    /* Silent for DA_CB_STALL_NS with voices playing and no error reported. The
+    /* Silent for da_stall_ns with voices playing and no error reported. The
      * stream cannot be restarted (same rule as a route change) - rebuild it. */
     __atomic_store_n(&mx->last_cb_ns, now, __ATOMIC_SEQ_CST);  /* arm one shot */
     mixer_request_reopen(mx, "data callback stalled");
