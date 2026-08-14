@@ -1,5 +1,23 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-08-14 — feat/live-runtime-config: live in-game "mailbox" (built, device test pending)
+
+Config is env-read once at attach, so cog changes need a relaunch. This branch adds a live channel:
+`BANNER_AUDIO_DIRECT_RUNTIME=<file>` names a flat KEY=VALUE mailbox (MS/MAXMS/PERF). A 1 s watcher thread
+(off the audio path) stats it; on change it re-reads and calls mixer_request_reopen, so a setting lands
+WITHOUT relaunch (the reopen worker rebuilds ~77 ms, inaudible). Overrides applied at the top of
+mixer_open_stream, so they win over launch config and re-apply on every reopen. Unset = feature off
+(byte-identical to v1.3.0). Keys<=0 revert to launch config. Build: run 31842661853 (sdk28/35).
+
+TEST (device): hot-swap the build, set RUNTIME=<path> + LOG=1 on a shortcut, launch, then
+`printf 'MS=8\n' > <path>` (chown to guest uid) and watch logcat for `runtime: reload` + a new `open:` at
+8 ms — no relaunch. NEXT: app-side writeDirectAudioRuntime() (sibling of applyAlsaAudioConfig, writes the file
+instead of a JNI call) hooked into the in-game cog.
+
+---
+
+# DirectAudio — Progress Log / Checkpoint
+
 ## 2026-08-14 — CHECKPOINT: **v1.3.0 shipped** (resume here)
 
 `main` = `31f42aba4`, tag `directaudio-v1.3.0` (Wine 11.0). GoW is long solved; the driver is
