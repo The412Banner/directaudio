@@ -68,7 +68,7 @@ The last two could not sustain 4 ms and **found their own floor** — see below.
 
 ## Adaptive buffering
 
-A fixed buffer is the wrong shape for this problem. Too small and a game under box64/FEX + DXVK crackles the moment a GPU submission stalls; too large and everything is needlessly late. DirectAudio starts at the requested size and **grows only in response to real underruns**, one burst at a time, up to the device capacity:
+A fixed buffer is the wrong shape for this problem. Too small and a game under box64/FEX + DXVK crackles the moment a GPU submission stalls; too large and everything is needlessly late. DirectAudio starts at the requested size and **grows only in response to real underruns**, one burst at a time, up to the growth ceiling (100 ms by default):
 
 - **Reclaims when calm.** Growth used to be one-way, so a single loading screen taxed latency for the whole session. After 10 s with no underrun the engine gives one burst back and sees if it holds. Naive shrinking oscillates — shrink, underrun, grow, shrink — and each cycle is an audible click, which is why Google's Oboe `LatencyTuner` refuses to shrink at all; two guards make it safe here. **It never goes below the size the stream opened at**, so it can only undo growth, never undercut the launch config. And an underrun within 5 s of a step down marks that level unsustainable for this title: the engine stops probing below it and doubles its patience, up to ~5 minutes. A game that genuinely needs headroom settles after a probe or two instead of clicking forever.
 - **Edge-triggered.** It reacts to a *rise* in AAudio's xrun counter, not its absolute value, so one bad moment during level loading doesn't permanently inflate the buffer.
@@ -116,17 +116,45 @@ This is event-level only — a handful of lines per session. Per-callback heartb
 
 ### Configuration
 
-Read from the environment at stream open:
+#### What it ships with
+
+With no host configuration at all, every value below is what the driver uses:
+
+| | shipped default | total latency |
+|---|---|---|
+| **buffer** | **12 ms** (`DA_DEFAULT_MS`, rounded up to a burst) | **33 ms** |
+| growth ceiling | 100 ms | 121 ms worst case |
+| performance mode | `LOW_LATENCY` | |
+| adaptive growth | on | |
+| decay (reclaim when calm) | on | |
+| device period | 10 ms (min 5 ms) | |
+| sharing mode | `SHARED` | |
+| callback watchdog | on, 1 s | |
+| verbose logging | off | |
+
+**Every latency figure in this README is a total** — the driver's buffer plus
+Android's fixed 21 ms. A "12 ms buffer" is 33 ms of delay to the ear. The env
+vars below are all set in **buffer** milliseconds, so `_MS=12` means 33 ms total.
+
+> **Release note.** The 12 ms / 33 ms default is *unreleased*. The current
+> release, **v1.2.1**, ships the old 62.5 ms buffer (**83 ms total**) and has
+> neither decay nor the ms knobs. Hosts that set `_BF` from a preset — Bannerlator
+> does — override the default either way and are unaffected by the change.
+
+#### Environment variables
+
+Read from the environment; per-stream knobs at stream open, the rest at process
+attach:
 
 | variable | meaning |
 |---|---|
 | `BANNER_AUDIO_DIRECT_PERF` | `0` NONE · `1` LOW_LATENCY *(default)* · `2` POWER_SAVING |
 | `BANNER_AUDIO_DIRECT_ADAPTIVE` | `1` adaptive growth *(default)* · `0` fixed buffer |
 | `BANNER_AUDIO_DIRECT_DECAY` | `1` reclaim latency when calm *(default)* · `0` grow-only |
-| `BANNER_AUDIO_DIRECT_BF` | initial buffer in frames (`0` = let AAudio choose) |
-| `BANNER_AUDIO_DIRECT_MBF` | cap for adaptive growth (`0` = device capacity) |
-| `BANNER_AUDIO_DIRECT_MS` | initial buffer in **milliseconds** — wins over `_BF` |
-| `BANNER_AUDIO_DIRECT_MAXMS` | growth ceiling in **milliseconds** — wins over `_MBF` |
+| `BANNER_AUDIO_DIRECT_BF` | initial buffer in frames (`0` = use the shipped default) |
+| `BANNER_AUDIO_DIRECT_MBF` | growth ceiling in frames (`0` = use the shipped default) |
+| `BANNER_AUDIO_DIRECT_MS` | initial buffer in **milliseconds** *(default 12 → 33 ms total)* — wins over `_BF` |
+| `BANNER_AUDIO_DIRECT_MAXMS` | growth ceiling in **milliseconds** *(default 100)* — wins over `_MBF` |
 | `BANNER_AUDIO_DIRECT_PERIOD_MS` | device period reported to the guest *(default 10)* |
 | `BANNER_AUDIO_DIRECT_MINPERIOD_MS` | minimum period reported to the guest *(default 5)* |
 | `BANNER_AUDIO_DIRECT_EXCLUSIVE` | `1` request an EXCLUSIVE AAudio stream · `0` SHARED *(default)* |
@@ -153,9 +181,9 @@ Variables** box — per-game, and it survives relaunches):
 BANNER_AUDIO_DIRECT_MS=8 BANNER_AUDIO_DIRECT_MAXMS=60
 ```
 
-That is the whole thing. `_MS` is the buffer the stream opens at and the level
-decay returns to; `_MAXMS` is as far as adaptive may climb when a title needs
-headroom. **`_MS` deliberately overrides `_BF`** — a host app writes `_BF` from
+That is the whole thing. `_MS` is the buffer the stream opens at **and the floor decay returns to** —
+the driver never goes below it, so it is a target, not just a starting point.
+`_MAXMS` is as far as adaptive may climb when a title needs headroom. **`_MS` deliberately overrides `_BF`** — a host app writes `_BF` from
 whichever preset is selected, so a hand-typed frame count is in a fight with the
 preset it cannot win. Nothing writes `_MS` but a person.
 
@@ -164,14 +192,15 @@ Two things to expect:
 - **The number gets rounded up.** AAudio serves whole bursts, so on a device with
   a 4 ms burst, `_MS=5` becomes 8 ms. The driver rounds up rather than down —
   under-serving a burst just underruns.
-- **It is the buffer, not the latency you hear.** Android adds its own output
-  latency on top — about 21 ms on the reference device, more on Bluetooth. A
-  4 ms buffer measured 25 ms end to end.
+- **It is the buffer, not the latency you hear.** Android adds a fixed 21 ms on
+  top (more on Bluetooth), so `_MS=8` is **29 ms total** and `_MS=12` is **33 ms**.
+  The floor is one burst — 4 ms of buffer, **25 ms total** — and nothing on
+  Android goes below it.
 
 Every stream open logs what was actually granted, so there is no guessing:
 
 ```
-DirectAudio: open: buffer 384 frames (8 ms) burst 192 cap 12000 - device adds its own output latency
+DirectAudio: open: buffer 576 frames (12 ms) burst 192 cap 4800 perf 12 sharing 0 period 10 ms - device adds its own output latency
 ```
 
 `adb logcat -s DirectAudio` shows it, on a release build, with no tracing enabled.
