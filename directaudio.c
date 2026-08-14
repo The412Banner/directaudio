@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <android/log.h>
 
 /* Blank the API-availability annotation before including AAudio.h so the API-28
  * AAudioStreamBuilder_setUsage we weak-guard below is not emitted as a STRONG
@@ -320,6 +321,13 @@ struct directaudio_mixer
     unsigned int wd_last_cb;  /* cb_count observed at the previous tick */
 };
 
+/* Event-level logging, ALWAYS ON. Only fires when the audio output is rebuilt -
+ * a handful of lines per session - so it is not telemetry and does not belong
+ * behind the diagnostics build. It is what makes a field report actionable:
+ * "audio glitched" becomes "the driver rebuilt the stream, and here is why".
+ * Per-callback heartbeats and per-call tracing stay in the diagnostics build. */
+#define DA_EVENT(...) __android_log_print(ANDROID_LOG_INFO, "DirectAudio", __VA_ARGS__)
+
 #define DA_FREEZE_GAP_NS  500000000ull   /* tick gap this large => guest was suspended */
 #define DA_CB_STALL_NS   1000000000ull   /* callback silent this long => stream is dead */
 
@@ -529,6 +537,7 @@ static void mixer_request_reopen(struct directaudio_mixer *mx, const char *why)
     {
         pthread_t th;
         WARN("%s - reopening mixer output\n", why);
+        DA_EVENT("reopen: %s", why);
         if (pthread_create(&th, NULL, mixer_reopen_thread, mx))
             __atomic_store_n(&mx->reopen_running, 0, __ATOMIC_SEQ_CST);
         else
