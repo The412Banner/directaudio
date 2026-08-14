@@ -201,7 +201,7 @@ jobs:
           export PATH="$HOME/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64/bin:$PATH"
           mkdir -p out
           x86_64-w64-mingw32-clang tools/daprobe/daprobe.c -o out/daprobe.exe \
-            -O2 -municode -Wall -Wextra -Wno-unused-parameter \
+            -O2 -Wall -Wextra -Wno-unused-parameter \
             -lole32 -loleaut32 -luuid
           ls -la out/daprobe.exe
           file out/daprobe.exe

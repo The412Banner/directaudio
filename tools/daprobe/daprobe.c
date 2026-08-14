@@ -30,6 +30,16 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Defined here rather than pulled from ksmedia.h: the mingw headers declare these
+ * subtype GUIDs but do not emit them, so linking against the header names fails.
+ * They are fixed, well-known values - the PCM/float subtypes of
+ * WAVEFORMATEXTENSIBLE - so carrying them locally costs nothing and removes a
+ * header dependency from a tool that must build anywhere. */
+DEFINE_GUID(DA_SUBTYPE_PCM,   0x00000001, 0x0000, 0x0010, 0x80, 0x00,
+            0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+DEFINE_GUID(DA_SUBTYPE_FLOAT, 0x00000003, 0x0000, 0x0010, 0x80, 0x00,
+            0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+
 static FILE *g_out;
 static char g_out_path[MAX_PATH * 2];
 
@@ -107,7 +117,7 @@ static void fill_format(WAVEFORMATEXTENSIBLE *w, const struct layout *l, int rat
     w->Format.cbSize          = sizeof(*w) - sizeof(WAVEFORMATEX);
     w->Samples.wValidBitsPerSample = (WORD)bits;
     w->dwChannelMask          = l->mask;
-    w->SubFormat = is_float ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
+    w->SubFormat = is_float ? DA_SUBTYPE_FLOAT : DA_SUBTYPE_PCM;
 }
 
 static const char *verdict(HRESULT hr)
@@ -128,7 +138,7 @@ static void describe_mix_format(const WAVEFORMATEX *f)
     else if (f->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
     {
         const WAVEFORMATEXTENSIBLE *e = (const WAVEFORMATEXTENSIBLE *)f;
-        if (IsEqualGUID(&e->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) kind = "float";
+        if (IsEqualGUID(&e->SubFormat, &DA_SUBTYPE_FLOAT)) kind = "float";
     }
     emit("  %lu Hz  %u-bit %s  %u ch", f->nSamplesPerSec, f->wBitsPerSample, kind, f->nChannels);
     if (f->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
