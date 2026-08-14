@@ -543,6 +543,28 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         else if (out[i] < -1.0f) out[i] = -1.0f;
     }
 
+    /* Everything past this point is bookkeeping on state the MIXER owns - liveness,
+     * xrun baseline, buffer sizing - and only the live stream may touch it. A stream
+     * that is no longer mx->aq still gets a callback or two: the outgoing one during
+     * a rebuild (it is destroyed after the new one is promoted) and the incoming one
+     * before promotion. Letting those through had the dying stream resize ITSELF and
+     * stamp the shared timers - device-proven 2026-08-14, where every rebuild logged
+     * "grow: 192 -> 384" from the old callback thread while the new stream's own
+     * heartbeats reported buf=192, and the new stream's first decay was pushed out by
+     * the quiet period. mixer_error_cb has carried this same guard from the start.
+     *
+     * Mixing above is deliberately NOT skipped: the outgoing stream keeps being fed
+     * until it is closed, so the handover stays silent.
+     *
+     * mx->aq is NULL for the very first open (it is assigned after requestStart), so
+     * a null current stream means "nothing promoted yet" and must not skip. */
+    {
+        AAudioStream *cur = __atomic_load_n(&mx->aq, __ATOMIC_SEQ_CST);
+
+        if (cur && aq != cur)
+            return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+
     /* Liveness for the watchdog. This MUST be unconditional - it used to be
      * folded into the TRACE_ON() test below, so with tracing off it never
      * advanced and a dead callback was indistinguishable from a live one. */
