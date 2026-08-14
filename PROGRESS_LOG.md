@@ -1,5 +1,23 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-08-14 — v1.3.1: live in-game config ("mailbox")
+
+`BANNER_AUDIO_DIRECT_RUNTIME=<file>` opts into live control: a flat KEY=VALUE mailbox (MS/MAXMS/PERF) the host
+rewrites while the game runs. A 1 s watcher thread (off the audio path) stats it and, on change, re-reads +
+rebuilds the stream via the existing reopen worker -> a setting lands WITHOUT relaunch (~77 ms, inaudible).
+Overrides applied at the top of mixer_open_stream so they win over launch config and re-apply on every reopen;
+values <=0 / absent keys revert to launch config. Unset = feature off (byte-identical to v1.3.0).
+
+Root-caused + fixed a mailbox PERF bug found on device: da_apply_runtime_overrides set mx->perf = raw 0/1/2, but
+the stream needs the AAudio enum (NONE=10/POWER_SAVING=11/LOW_LATENCY=12). A PERF=0 write opened an invalid perf
+mode -> data callback stalled -> watchdog reopen loop -> dead audio. Now mapped like read_config_from_env; also
+reset overrides on each read so an absent key reverts. Device stress-proven: PERF toggles + bg/fg cycles, 0 stalls.
+(POWER_SAVING is unstable for DirectAudio under box64/FEX and is handled host-side, not in the driver.)
+
+---
+
+# DirectAudio — Progress Log / Checkpoint
+
 ## 2026-08-14 — feat/live-runtime-config: live in-game "mailbox" (built, device test pending)
 
 Config is env-read once at attach, so cog changes need a relaunch. This branch adds a live channel:

@@ -19,7 +19,7 @@ DirectAudio game → winedirectaudio.drv → in-process mixer ──────
 
 ## Status
 
-Device-proven, shipping. Current release **v1.3.0**. Output: 48 kHz · float · stereo.
+Device-proven, shipping. Current release **v1.3.1**. Output: 48 kHz · float · stereo.
 
 ---
 
@@ -165,6 +165,7 @@ attach:
 | `BANNER_AUDIO_DIRECT_DECAY_PUNISH_MS` | window in which an underrun blames the last step *(default 5000)* |
 | `BANNER_AUDIO_DIRECT_DECAY_MAXBACKOFF` | cap on the quiet-period multiplier *(default 32)* |
 | `BANNER_AUDIO_DIRECT_LOG` | `1` verbose logcat on a **release** build *(default 0)* |
+| `BANNER_AUDIO_DIRECT_RUNTIME` | path to a live-config "mailbox" file the host rewrites in-game *(unset = off)* — see below |
 
 Everything is read once — the per-stream knobs at stream open, the period,
 watchdog, decay and log settings at process attach (the guest asks for the
@@ -221,6 +222,14 @@ latency win and a real CPU cost, and under box64/FEX the cost is not small —
 treat it as a per-title experiment, not a default. The minimum is clamped to the
 default if you set them inconsistently, since WASAPI does not allow the minimum
 period to exceed the default one.
+
+#### Live in-game config (the mailbox)
+
+The driver reads its config from the env at stream open, which means a host UI change would normally need a relaunch. `BANNER_AUDIO_DIRECT_RUNTIME=<path>` opts into live control: it names a flat `KEY=VALUE` file the host rewrites while the game runs. A lazy 1-second watcher thread (off the audio path) `stat`s it and, on change, re-reads and rebuilds the stream from the existing reopen worker — so a setting change lands **without relaunch** (~77 ms swap, inaudible). Keys are `MS` / `MAXMS` (milliseconds) and `PERF` (`0/1/2`, same encoding as `_PERF`); values ≤ 0 or an absent key revert to the launch config. Unset `_RUNTIME` = off, and the driver behaves exactly as before.
+
+```
+printf 'MS=8\nPERF=1\n' > "$BANNER_AUDIO_DIRECT_RUNTIME"   # → the running stream reopens at 8 ms, LOW_LATENCY
+```
 
 #### Diagnosing without a special build
 
@@ -288,14 +297,14 @@ Then apply the two small integration deltas that live **outside** this directory
 ### Pulling a new version into a consumer
 ```sh
 git -C dlls/winedirectaudio.drv fetch --tags
-git -C dlls/winedirectaudio.drv checkout directaudio-v1.3.0   # pin to a tagged, ABI-matched release
-git add dlls/winedirectaudio.drv && git commit -m "bump directaudio → v1.3.0"
+git -C dlls/winedirectaudio.drv checkout directaudio-v1.3.1   # pin to a tagged, ABI-matched release
+git add dlls/winedirectaudio.drv && git commit -m "bump directaudio → v1.3.1"
 ```
 The consumer always builds from a **pinned** driver commit — reproducible, never a moving target.
 
 ## ABI pinning — the one hard constraint
 
-Each tagged release is **ABI-matched to a Wine base** (the `mmdevapi` unixlib vtable must match the `mmdevapi.dll` it ships with). Tags are named accordingly, e.g. `directaudio-v1.3.0` · Wine 11.0. New *driver logic* builds fine against the pinned base; a new *Wine base* means re-pinning and rebuilding.
+Each tagged release is **ABI-matched to a Wine base** (the `mmdevapi` unixlib vtable must match the `mmdevapi.dll` it ships with). Tags are named accordingly, e.g. `directaudio-v1.3.1` · Wine 11.0. New *driver logic* builds fine against the pinned base; a new *Wine base* means re-pinning and rebuilding.
 
 ## Contributing
 
