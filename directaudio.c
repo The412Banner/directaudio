@@ -304,6 +304,10 @@ static aaudio_format_t fmt_to_aaudio(const WAVEFORMATEX *fmt)
 #define MIX_OUT_CHANNELS 2
 #define MIX_MAX_VOICES   64
 
+/* Where the output limiter starts compressing. High enough that normal material
+ * never reaches it, low enough to have room to bend before full scale. */
+#define DA_KNEE 0.75f
+
 /* Shipping defaults, used when the host sets no buffer config at all - which is
  * the normal case for a host that bundles this driver without wiring the env up.
  *
@@ -537,10 +541,29 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         mix_voice(mx->voices[i], out, numFrames);
     pthread_mutex_unlock(&mx->lock);
 
+    /* Soft knee instead of a hard clip. Two things push the mix past full scale:
+     * several voices summing, and the multichannel fold in downmix_stereo(), which
+     * is a correct ITU-style fold (centre and surrounds at -3 dB) but carries NO
+     * headroom - a 5.1 source peaks at 1 + 0.7071 + 0.7071 = 2.41x. Hard clipping
+     * that is the audible failure: flat tops, and the harmonics they generate.
+     *
+     * Below DA_KNEE the signal is untouched, so ordinary material is bit-identical
+     * and nothing gets quieter - the alternative, scaling every fold down by 2.41x,
+     * would cost 7.6 dB on all surround content to protect a peak it rarely hits.
+     * Above the knee it compresses along u/(1+u), which is C1-continuous at the
+     * knee and asymptotic to 1.0, so it can never wrap or overshoot. Two multiplies
+     * and a divide on the samples that need it, none on the ones that do not. */
     for (i = 0; i < n2; i++)
     {
-        if (out[i] > 1.0f) out[i] = 1.0f;
-        else if (out[i] < -1.0f) out[i] = -1.0f;
+        float x = out[i];
+        float a = x < 0.0f ? -x : x;
+
+        if (a > DA_KNEE)
+        {
+            float u = (a - DA_KNEE) / (1.0f - DA_KNEE);
+            float y = DA_KNEE + (1.0f - DA_KNEE) * (u / (1.0f + u));
+            out[i] = x < 0.0f ? -y : y;
+        }
     }
 
     /* Everything past this point is bookkeeping on state the MIXER owns - liveness,
@@ -820,11 +843,15 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
      * what the device actually granted instead of guessing. The buffer is the
      * part we control; AudioFlinger adds its own output latency on top (~21 ms on
      * the reference device), which is why this says "buffer" and not "latency". */
-    DA_EVENT("open: buffer %d frames (%d ms) burst %d cap %d perf %d sharing %d period %d ms"
-             " - device adds its own output latency",
+    /* sharing is req/got, not just got: AAudio grants SHARED when it cannot honour
+     * an EXCLUSIVE request and reports no error, so a lone "got" cannot tell a
+     * refusal from a request that was never made. (AAudio enum: EXCLUSIVE=0,
+     * SHARED=1.) Device-checked 2026-08-14: this device refuses EXCLUSIVE. */
+    DA_EVENT("open: buffer %d frames (%d ms) burst %d cap %d perf %d sharing req=%d got=%d"
+             " period %d ms - device adds its own output latency",
              mx->base_buf_frames, mx->base_buf_frames * 1000 / MIX_OUT_RATE,
              AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferCapacityInFrames(aq),
-             AAudioStream_getPerformanceMode(aq), AAudioStream_getSharingMode(aq),
+             AAudioStream_getPerformanceMode(aq), mx->share, AAudioStream_getSharingMode(aq),
              (int)(def_period / 10000));
 
     r = AAudioStream_requestStart(aq);
