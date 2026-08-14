@@ -55,6 +55,16 @@
 extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuilder *builder,
                                                                aaudio_usage_t usage);
 
+/* setChannelMask is API 32+. Same weak guard: opt-in surround
+ * (BANNER_AUDIO_DIRECT_SURROUND=1) requests a 5.1 *positional* stream, which is
+ * what makes the content eligible for Android's Spatializer on headphones. On
+ * older libaaudio the ref stays NULL and we fall back to a stereo count. */
+extern __attribute__((weak)) void AAudioStreamBuilder_setChannelMask(AAudioStreamBuilder *builder,
+                                                                     aaudio_channel_mask_t mask);
+#ifndef AAUDIO_CHANNEL_5POINT1
+#define AAUDIO_CHANNEL_5POINT1 0x3f
+#endif
+
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
@@ -335,6 +345,7 @@ struct directaudio_mixer
     AAudioStream *aq;
     struct directaudio_stream *voices[MIX_MAX_VOICES];
     int nvoices;
+    int out_channels;     /* live AAudio output channels; 2 unless 5.1 was granted */
     aaudio_performance_mode_t perf;
     aaudio_sharing_mode_t share;
     BOOL adaptive;
@@ -394,6 +405,7 @@ static UINT64 da_punish_ns = DA_DECAY_PUNISH_NS;
 static unsigned int da_max_backoff = DA_DECAY_MAX_BACKOFF;
 static BOOL da_watchdog = TRUE;
 static int da_log = 0;
+static BOOL da_surround = FALSE;   /* BANNER_AUDIO_DIRECT_SURROUND: opt-in 5.1 output */
 
 /* Verbose logging in a RELEASE build. The diagnostics build stays the place for
  * per-call tracing, but a field report should not require shipping someone a
@@ -450,9 +462,37 @@ static inline void downmix_stereo(int ch, const float *s, float *L, float *R)
     }
 }
 
-/* read the voice frame at (lcl_offs+idx), down-mixed to stereo float */
-static inline void voice_frame_stereo(struct directaudio_stream *v, UINT32 idx,
-                                      float *L, float *R)
+/* map an N-channel source frame to the OUT-channel mix layout. out_ch == 2 keeps
+ * the exact stereo fold, so the default (non-surround) path is unchanged; out_ch
+ * > 2 up/down-maps to the AAudio 5.1 layout (FL FR FC LFE BL BR), which matches
+ * the WAVEFORMATEX 5.1 order, so a 5.1 source passes straight through. */
+static inline void mix_map(int src_ch, int out_ch, const float *s, float *o)
+{
+    const float c = 0.7071f;
+    int k;
+
+    if (out_ch == 2) { downmix_stereo(src_ch, s, &o[0], &o[1]); return; }
+
+    for (k = 0; k < out_ch; k++) o[k] = 0.0f;
+    switch (src_ch)
+    {
+    case 1:  o[0] = o[1] = s[0]; return;                      /* mono   -> FL FR     */
+    case 2:  o[0] = s[0]; o[1] = s[1]; return;                /* stereo -> FL FR     */
+    case 3:  o[0] = s[0]; o[1] = s[1];                        /* 2.1    -> FL FR LFE */
+             if (out_ch > 3) o[3] = s[2]; return;
+    case 4:  o[0] = s[0]; o[1] = s[1];                        /* quad   -> FL FR BL BR */
+             if (out_ch >= 6) { o[4] = s[2]; o[5] = s[3]; }
+             else { o[0] += c*s[2]; o[1] += c*s[3]; } return;
+    case 6:  for (k = 0; k < 6 && k < out_ch; k++) o[k] = s[k]; return;   /* 5.1 passthrough */
+    case 8:  for (k = 0; k < 6 && k < out_ch; k++) o[k] = s[k];           /* 7.1 -> 5.1 */
+             if (out_ch >= 6) { o[4] += c*s[6]; o[5] += c*s[7]; } return; /* fold sides into backs */
+    default: for (k = 0; k < src_ch && k < out_ch; k++) o[k] = s[k]; return;
+    }
+}
+
+/* read the voice frame at (lcl_offs+idx), mapped to the OUT-channel layout */
+static inline void voice_frame_nch(struct directaudio_stream *v, UINT32 idx,
+                                   int out_ch, float *o)
 {
     UINT32 pos = (v->lcl_offs_frames + idx) % v->bufsize_frames;
     const BYTE *frame = v->local_buffer + (size_t)pos * v->fmt->nBlockAlign;
@@ -466,11 +506,11 @@ static inline void voice_frame_stereo(struct directaudio_stream *v, UINT32 idx,
         if (v->vols_active) val *= v->vols[c < 8 ? c : 7];
         s[c] = val;
     }
-    downmix_stereo(ch, s, L, R);
+    mix_map(ch, out_ch, s, o);
 }
 
-/* sum one voice into the stereo float mix buffer (out holds numFrames*2 floats) */
-static void mix_voice(struct directaudio_stream *v, float *out, int32_t numFrames)
+/* sum one voice into the OUT-channel float mix buffer (out holds numFrames*out_ch) */
+static void mix_voice(struct directaudio_stream *v, float *out, int32_t numFrames, int out_ch)
 {
     pthread_mutex_lock(&v->lock);
 
@@ -485,10 +525,10 @@ static void mix_voice(struct directaudio_stream *v, float *out, int32_t numFrame
         UINT32 n = min((UINT32)numFrames, v->held_frames), f;
         for (f = 0; f < n; f++)
         {
-            float L, R;
-            voice_frame_stereo(v, f, &L, &R);
-            out[2*f]     += L;
-            out[2*f + 1] += R;
+            float o[8];
+            int k;
+            voice_frame_nch(v, f, out_ch, o);
+            for (k = 0; k < out_ch; k++) out[out_ch*f + k] += o[k];
         }
         v->lcl_offs_frames = (v->lcl_offs_frames + n) % v->bufsize_frames;
         v->held_frames -= n;
@@ -500,15 +540,16 @@ static void mix_voice(struct directaudio_stream *v, float *out, int32_t numFrame
         for (f = 0; f < numFrames; f++)
         {
             UINT32 i0 = (UINT32)v->rs_pos;
-            float L0, R0, L1, R1;
+            float a[8], b[8];
             double frac;
+            int k;
 
             if (i0 + 1 >= v->held_frames) break;   /* ran dry - remaining stays silent */
-            voice_frame_stereo(v, i0, &L0, &R0);
-            voice_frame_stereo(v, i0 + 1, &L1, &R1);
+            voice_frame_nch(v, i0, out_ch, a);
+            voice_frame_nch(v, i0 + 1, out_ch, b);
             frac = v->rs_pos - i0;
-            out[2*f]     += (float)(L0 + (L1 - L0) * frac);
-            out[2*f + 1] += (float)(R0 + (R1 - R0) * frac);
+            for (k = 0; k < out_ch; k++)
+                out[out_ch*f + k] += (float)(a[k] + (b[k] - a[k]) * frac);
             v->rs_pos += ratio;
         }
         consumed = (int32_t)v->rs_pos;
@@ -531,14 +572,15 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
 {
     struct directaudio_mixer *mx = user;
     float *out = audioData;
-    int32_t i, n2 = numFrames * MIX_OUT_CHANNELS;
+    int32_t oc = mx->out_channels > 0 ? mx->out_channels : MIX_OUT_CHANNELS;
+    int32_t i, n2 = numFrames * oc;
     UINT64 now;
 
     memset(out, 0, (size_t)n2 * sizeof(float));
 
     pthread_mutex_lock(&mx->lock);
     for (i = 0; i < mx->nvoices; i++)
-        mix_voice(mx->voices[i], out, numFrames);
+        mix_voice(mx->voices[i], out, numFrames, oc);
     pthread_mutex_unlock(&mx->lock);
 
     /* Soft knee instead of a hard clip. Two things push the mix past full scale:
@@ -767,7 +809,15 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     if (AAudioStreamBuilder_setUsage && android_get_device_api_level() >= 28)
         AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_GAME);
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-    AAudioStreamBuilder_setChannelCount(builder, MIX_OUT_CHANNELS);
+    /* Opt-in 5.1: a positional channel MASK (not a bare count) is what makes the
+     * content eligible for Android's Spatializer. Weak-guarded like setUsage; on
+     * older libaaudio, or without SURROUND, ask for plain stereo. If the 5.1 open
+     * is refused we retry stereo below, and the granted count drives the mixer. */
+    if (da_surround && AAudioStreamBuilder_setChannelMask &&
+        android_get_device_api_level() >= 32)
+        AAudioStreamBuilder_setChannelMask(builder, AAUDIO_CHANNEL_5POINT1);
+    else
+        AAudioStreamBuilder_setChannelCount(builder, MIX_OUT_CHANNELS);
     AAudioStreamBuilder_setSampleRate(builder, MIX_OUT_RATE);
     AAudioStreamBuilder_setDataCallback(builder, mixer_cb, mx);
     AAudioStreamBuilder_setErrorCallback(builder, mixer_error_cb, mx);
@@ -783,9 +833,23 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     }
 
     r = AAudioStreamBuilder_openStream(builder, &aq);
+    if ((r != AAUDIO_OK || !aq) && da_surround && AAudioStreamBuilder_setChannelMask)
+    {
+        /* 5.1 was refused - fall back to a stereo stream so audio still plays.
+         * DA_EVENT so a field report shows surround was asked for and declined. */
+        DA_EVENT("surround: 5.1 open refused (%d) - falling back to stereo", r);
+        AAudioStreamBuilder_setChannelMask(builder, 0 /* AAUDIO_UNSPECIFIED */);
+        AAudioStreamBuilder_setChannelCount(builder, MIX_OUT_CHANNELS);
+        r = AAudioStreamBuilder_openStream(builder, &aq);
+    }
     AAudioStreamBuilder_delete(builder);
     if (r != AAUDIO_OK || !aq)
         return r != AAUDIO_OK ? r : AAUDIO_ERROR_INTERNAL;
+
+    /* The mixer renders to whatever count AAudio actually granted (5.1 requests
+     * can come back as stereo when the framework downmixes for the endpoint). */
+    mx->out_channels = AAudioStream_getChannelCount(aq);
+    if (mx->out_channels < 1) mx->out_channels = MIX_OUT_CHANNELS;
 
     {
         int32_t cap = AAudioStream_getBufferCapacityInFrames(aq);
@@ -848,11 +912,11 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
      * refusal from a request that was never made. (AAudio enum: EXCLUSIVE=0,
      * SHARED=1.) Device-checked 2026-08-14: this device refuses EXCLUSIVE. */
     DA_EVENT("open: buffer %d frames (%d ms) burst %d cap %d perf %d sharing req=%d got=%d"
-             " period %d ms - device adds its own output latency",
+             " channels %d period %d ms - device adds its own output latency",
              mx->base_buf_frames, mx->base_buf_frames * 1000 / MIX_OUT_RATE,
              AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferCapacityInFrames(aq),
              AAudioStream_getPerformanceMode(aq), mx->share, AAudioStream_getSharingMode(aq),
-             (int)(def_period / 10000));
+             mx->out_channels, (int)(def_period / 10000));
 
     r = AAudioStream_requestStart(aq);
     if (r != AAUDIO_OK)
@@ -1071,6 +1135,11 @@ static void read_global_config_from_env(void)
         const char *e = getenv("BANNER_AUDIO_DIRECT_WATCHDOG");
         if (e && *e) da_watchdog = atoi(e) != 0;
     }
+    {
+        /* Opt-in 5.1 output. Boolean, same explicit read as the watchdog. */
+        const char *e = getenv("BANNER_AUDIO_DIRECT_SURROUND");
+        if (e && *e) da_surround = atoi(e) != 0;
+    }
     if ((ms = env_pos("BANNER_AUDIO_DIRECT_STALL_MS", 0)) > 0)
         da_stall_ns = (UINT64)ms * 1000000ull;
     if ((ms = env_pos("BANNER_AUDIO_DIRECT_DECAY_QUIET_MS", 0)) > 0)
@@ -1083,10 +1152,10 @@ static void read_global_config_from_env(void)
     da_log = env_pos("BANNER_AUDIO_DIRECT_LOG", 0);
 
     DA_LOG("config: period %d ms min %d ms watchdog %d stall %d ms quiet %d ms"
-           " punish %d ms maxbackoff %u",
+           " punish %d ms maxbackoff %u surround %d",
            (int)(def_period / 10000), (int)(min_period / 10000), da_watchdog,
            (int)(da_stall_ns / 1000000), (int)(da_quiet_ns / 1000000),
-           (int)(da_punish_ns / 1000000), da_max_backoff);
+           (int)(da_punish_ns / 1000000), da_max_backoff, da_surround);
 }
 
 static NTSTATUS unix_process_attach(void *args)
@@ -1363,14 +1432,19 @@ static DWORD get_channel_mask(unsigned int channels)
 static NTSTATUS unix_get_mix_format(void *args)
 {
     struct get_mix_format_params *params = args;
+    /* Opt-in surround advertises a 5.1 shared mix format, so mmdevapi hands the
+     * driver 6-channel frames to render instead of pre-folding to stereo. If the
+     * device only opens a stereo output, the mixer folds 5.1->2 exactly as before
+     * (see mix_map), so advertising 5.1 is safe even when 5.1 is not granted. */
+    unsigned int nch = da_surround ? 6 : 2;
 
     /* AAudio has no NDK device enumeration before API 34; advertise a standard
      * AAudio-friendly shared mix format. mmdevapi resamples the guest to this. */
     params->fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    params->fmt->Format.nChannels = 2;
+    params->fmt->Format.nChannels = nch;
     params->fmt->Format.nSamplesPerSec = 48000;
     params->fmt->Format.wBitsPerSample = 32;
-    params->fmt->dwChannelMask = get_channel_mask(2);
+    params->fmt->dwChannelMask = get_channel_mask(nch);
     params->fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
     params->fmt->Format.nBlockAlign = params->fmt->Format.wBitsPerSample *
@@ -1380,7 +1454,7 @@ static NTSTATUS unix_get_mix_format(void *args)
     params->fmt->Samples.wValidBitsPerSample = params->fmt->Format.wBitsPerSample;
     params->fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
 
-    TRACE("get_mix_format: flow=%d -> 48000/32f/2ch\n", params->flow);
+    TRACE("get_mix_format: flow=%d -> 48000/32f/%uch\n", params->flow, nch);
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
