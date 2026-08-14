@@ -1,5 +1,49 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-08-14 — CHECKPOINT: **v1.3.0 shipped** (resume here)
+
+`main` = `31f42aba4`, tag `directaudio-v1.3.0` (Wine 11.0). GoW is long solved; the driver is
+a stable, low-latency, self-healing shared-mixer backend.
+
+### Shipped since the 2026-08-12 checkpoint below
+- **v1.2** (`directaudio-v1.2`) — `mmdevapi_midi_n` spin fix: `unix_midi_get_driver` returns
+  `L"alsa"` so mmdevapi delegates MIDI to winealsa instead of DirectAudio becoming its own
+  MIDI driver and spinning a whole CPU core. GoW renders. Returned a core to **every** DA title.
+- **v1.2.1** (`directaudio-v1.2.1`) — dead-AAudio-callback watchdog: a background/foreground
+  cycle could starve the stream so AudioTrack self-disabled and the data callback never
+  resumed (no error raised) → permanent silence. Per-period `mixer_watchdog()` rebuilds after
+  1 s of silence-with-voices; `DA_EVENT` reopen lines are on in the release build.
+- **v1.2.2** (`directaudio-v1.2.2`) — adaptive **decay** (a grown buffer comes back down when
+  calm), **millisecond latency** knobs (`_MS`/`_MAXMS`, `_PERIOD_MS`), the rest of the tuning
+  exposed to the environment, and the new **12 ms / 33 ms shipped default** (was 62.5 ms/83 ms).
+- **v1.3.0** (`directaudio-v1.3.0`) — the four post-v1.2.2 wins:
+  1. **Soft-knee limiter** on the 5.1→stereo downmix (was clipping at ~2.41× full scale) —
+     roadmap item "downmix headroom", **done**.
+  2. **Exclusive-mode honesty** — stopped claiming EXCLUSIVE support the driver never provided;
+     the open log now reports granted vs requested sharing mode (`sharing req=/got=`).
+  3. **`daprobe`** — a WASAPI capability-probe exe on its own workflow (accepted/native/rendered).
+  4. Sharing `req=/got=` logging.
+
+### Device-proven at the new default
+7-game sweep: 5/7 titles hold the 4 ms floor (**25 ms total**); GoW 384 fr / 29 ms, DiRT 3
+576 fr / 33 ms, zero underruns, no MIDI spin anywhere. New-default (12 ms) validated on GoW at
+light load (voices≈1–2, xruns 0, decay idle); **high-voice combat stress not yet captured**.
+
+### Three-engine probe baseline (`daprobe`)
+DA: 10 ms period, renders native **48 kHz** (no resample). winealsa: honest stereo-only, ≤48 kHz,
+10 ms period. winepulse: 20 ms period, **44.1 kHz → resamples** 48 kHz audio. See README + the
+`reference_directaudio_probe_three_engine_baseline` note.
+
+### Roadmap — where it stands
+Done: downmix headroom (v1.3.0). Next: **route-change format handling** → **real surround**
+(Android Spatializer 5.1) → **mic capture**. Plus: Mali verification, a lower host preset rung.
+
+### Branches
+`main`/tags = ship code. `diagnostics` = main + 1 instrumentation commit (23 logcat probes),
+kept rebased on main — `git rebase main` after each release, then dispatch its build.
+
+---
+
 ## 2026-08-12 — CHECKPOINT (resume here)
 
 Native Wine mmdevapi backend → Android AAudio (one shared AAudio output + in-process

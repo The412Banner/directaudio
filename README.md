@@ -19,7 +19,7 @@ DirectAudio game → winedirectaudio.drv → in-process mixer ──────
 
 ## Status
 
-Device-proven, shipping. Current release **v1.2.1**. Output: 48 kHz · float · stereo.
+Device-proven, shipping. Current release **v1.3.0**. Output: 48 kHz · float · stereo.
 
 ---
 
@@ -136,10 +136,11 @@ With no host configuration at all, every value below is what the driver uses:
 Android's fixed 21 ms. A "12 ms buffer" is 33 ms of delay to the ear. The env
 vars below are all set in **buffer** milliseconds, so `_MS=12` means 33 ms total.
 
-> **Release note.** The 12 ms / 33 ms default is *unreleased*. The current
-> release, **v1.2.1**, ships the old 62.5 ms buffer (**83 ms total**) and has
-> neither decay nor the ms knobs. Hosts that set `_BF` from a preset — Bannerlator
-> does — override the default either way and are unaffected by the change.
+> **Release note.** The 12 ms / 33 ms default, adaptive decay, and the millisecond
+> knobs shipped in **v1.2.2** and are current in **v1.3.0**. (Releases before v1.2.2
+> opened at a 62.5 ms buffer — **83 ms total** — with no decay and no ms knobs.)
+> Hosts that set `_BF` from a preset — Bannerlator does — override the default
+> either way.
 
 #### Environment variables
 
@@ -200,7 +201,7 @@ Two things to expect:
 Every stream open logs what was actually granted, so there is no guessing:
 
 ```
-DirectAudio: open: buffer 576 frames (12 ms) burst 192 cap 4800 perf 12 sharing 0 period 10 ms - device adds its own output latency
+DirectAudio: open: buffer 576 frames (12 ms) burst 192 cap 4800 perf 12 sharing req=0 got=0 period 10 ms - device adds its own output latency
 ```
 
 `adb logcat -s DirectAudio` shows it, on a release build, with no tracing enabled.
@@ -243,12 +244,19 @@ cannot, so check the open log for what you actually got.
 
 Ordered by value against effort. The governing constraint: **none of these may add a daemon or an IPC hop** — the short route to AAudio is the whole point.
 
+**Shipped in v1.3.0** (three items, one of them straight off this list):
+
+- ✅ **Downmix headroom** — the 5.1 → stereo fold (a correct ITU-style mix, centre and surrounds at −3 dB) used to peak at ~2.41× full scale and hard-clip loud content. It now runs through a **soft-knee limiter**, so surround downmix no longer clips, at no latency cost.
+- ✅ **Honest exclusive-mode reporting** — `create_stream` used to register every stream as an ordinary shared mixer voice while still *claiming* EXCLUSIVE support. That claim is gone; the open log now reports the **granted** sharing mode next to the requested one (`sharing req=/got=`), so `_EXCLUSIVE=1` is truthful about what the device actually gave back.
+- ✅ **`daprobe`** — a small WASAPI capability-probe `.exe` (built by its own workflow) that reports the three answers a game can get and confuses: **accepted** in shared mode (mmdevapi converts, so nearly everything), **natively openable** in exclusive mode (the honest one), and **rendered** (`GetMixFormat`, currently 48 kHz float stereo). It is the measuring instrument for the surround work below.
+
+Remaining, in order:
+
 | | item | why |
 |---|---|---|
-| 1 | **Downmix headroom** | The 5.1 → stereo fold is a correct ITU-style mix (centre and surrounds at −3 dB) but has no headroom — it can peak at ~2.41× full scale and clip on loud content. A normalisation factor or soft limiter is a few lines and costs no latency. |
-| 2 | **Route-change format handling** | A new route can have a different sample rate (Bluetooth is often 44.1 kHz where the speaker is 48) and a very different burst size. The rebuild needs to re-derive the resampler ratio and re-apply adaptive sizing, and coalesce repeated disconnect events. |
-| 3 | **Real surround** | Negotiate 6/8 channels and pass through where the device grants it (HDMI, USB DAC). On Android 13+, hand AAudio a real 5.1 stream with a channel mask and let the platform **Spatializer** do binaural rendering on headphones — genuine surround with the DSP cost carried by Android. |
-| 4 | **Microphone capture** | A second AAudio stream in the `INPUT` direction; the capture half of the vtable is already wired but no capture endpoint is exposed. Opened lazily so single-player titles never pay for it. **This is the one item that could threaten the latency floor** — on some devices an input stream knocks the output off the fast path, so it needs measuring rather than assuming. |
+| 1 | **Route-change format handling** | A new route can have a different sample rate (Bluetooth is often 44.1 kHz where the speaker is 48) and a very different burst size. The rebuild needs to re-derive the resampler ratio and re-apply adaptive sizing, and coalesce repeated disconnect events. |
+| 2 | **Real surround** | Negotiate 6/8 channels and pass through where the device grants it (HDMI, USB DAC). On Android 13+, hand AAudio a real 5.1 stream with a channel mask and let the platform **Spatializer** do binaural rendering on headphones — genuine surround with the DSP cost carried by Android. With headroom now handled, this is the next real audio-quality win. |
+| 3 | **Microphone capture** | A second AAudio stream in the `INPUT` direction; the capture half of the vtable is already wired but no capture endpoint is exposed. Opened lazily so single-player titles never pay for it. **This is the one item that could threaten the latency floor** — on some devices an input stream knocks the output off the fast path, so it needs measuring rather than assuming. |
 
 Also wanted: verification on Mali hardware, and a lower preset rung in host apps so the 4 ms buffer is reachable from a UI rather than only by environment variable.
 
@@ -280,14 +288,14 @@ Then apply the two small integration deltas that live **outside** this directory
 ### Pulling a new version into a consumer
 ```sh
 git -C dlls/winedirectaudio.drv fetch --tags
-git -C dlls/winedirectaudio.drv checkout directaudio-v1.2.1   # pin to a tagged, ABI-matched release
-git add dlls/winedirectaudio.drv && git commit -m "bump directaudio → v1.2.1"
+git -C dlls/winedirectaudio.drv checkout directaudio-v1.3.0   # pin to a tagged, ABI-matched release
+git add dlls/winedirectaudio.drv && git commit -m "bump directaudio → v1.3.0"
 ```
 The consumer always builds from a **pinned** driver commit — reproducible, never a moving target.
 
 ## ABI pinning — the one hard constraint
 
-Each tagged release is **ABI-matched to a Wine base** (the `mmdevapi` unixlib vtable must match the `mmdevapi.dll` it ships with). Tags are named accordingly, e.g. `directaudio-v1.2.1` · Wine 11.0. New *driver logic* builds fine against the pinned base; a new *Wine base* means re-pinning and rebuilding.
+Each tagged release is **ABI-matched to a Wine base** (the `mmdevapi` unixlib vtable must match the `mmdevapi.dll` it ships with). Tags are named accordingly, e.g. `directaudio-v1.3.0` · Wine 11.0. New *driver logic* builds fine against the pinned base; a new *Wine base* means re-pinning and rebuilding.
 
 ## Contributing
 
