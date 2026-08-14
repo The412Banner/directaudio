@@ -1387,9 +1387,22 @@ static NTSTATUS unix_is_format_supported(void *args)
     }
     else if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
     {
-        /* Exclusive streams hand the guest format straight to AAudio with no
-         * conversion, so we can only honour what AAudio opens natively. */
-        params->result = (aafmt != AAUDIO_FORMAT_UNSPECIFIED)
+        /* Exclusive means "hand the guest format through untouched", so the only
+         * honest answer is the format the output actually runs at. We do not open
+         * an exclusive stream at all - create_stream registers every stream as a
+         * mixer voice regardless of share mode - so anything else would be a
+         * promise of untouched audio that we then downmix and resample.
+         *
+         * Checking the sample format alone was not enough: daprobe (tools/daprobe)
+         * caught this answering S_OK to EXCLUSIVE 7.1 at 192 kHz, which we would
+         * fold to stereo 48 kHz. A game asks for exclusive precisely when it wants
+         * to skip its own mixing, so a wrong yes there can put channels in the
+         * wrong places rather than merely losing the surround. Refusing costs
+         * nothing: the caller falls back to shared, which is what it was getting.
+         * winealsa answers this the same narrow way. */
+        params->result = (aafmt != AAUDIO_FORMAT_UNSPECIFIED &&
+                          fmt->nChannels <= MIX_OUT_CHANNELS &&
+                          fmt->nSamplesPerSec == MIX_OUT_RATE)
                          ? S_OK : AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
     else /* AUDCLNT_SHAREMODE_SHARED */
