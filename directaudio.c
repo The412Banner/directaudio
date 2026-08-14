@@ -346,6 +346,7 @@ struct directaudio_mixer
     struct directaudio_stream *voices[MIX_MAX_VOICES];
     int nvoices;
     int out_channels;     /* live AAudio output channels; 2 unless 5.1 was granted */
+    float ch_peak[8];     /* per-channel peak since last heartbeat (surround diagnostic) */
     aaudio_performance_mode_t perf;
     aaudio_sharing_mode_t share;
     BOOL adaptive;
@@ -608,6 +609,22 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         }
     }
 
+    /* Per-channel peak meter (surround diagnostic, LOG=1 only): tells whether the
+     * surround channels carry discrete signal or are silent - i.e. real 5.1 from
+     * the game vs. an upmixed-stereo 5.1 container. Accumulated across callbacks,
+     * reported and reset at the heartbeat. Skipped entirely for stereo output. */
+    if (da_log && oc > 2)
+    {
+        int32_t f, k;
+        for (f = 0; f < numFrames; f++)
+            for (k = 0; k < oc && k < 8; k++)
+            {
+                float a = out[oc*f + k];
+                if (a < 0.0f) a = -a;
+                if (a > mx->ch_peak[k]) mx->ch_peak[k] = a;
+            }
+    }
+
     /* Everything past this point is bookkeeping on state the MIXER owns - liveness,
      * xrun baseline, buffer sizing - and only the live stream may touch it. A stream
      * that is no longer mx->aq still gets a callback or two: the outgoing one during
@@ -728,9 +745,26 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
               AAudioStream_getXRunCount(aq));
 
     if (da_log && !(mx->cb_count % 1000))
-        DA_EVENT("hb: cb=%u voices=%d buf=%d cap=%d xruns=%d", mx->cb_count, mx->nvoices,
-                 AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
-                 AAudioStream_getXRunCount(aq));
+    {
+        if (mx->out_channels > 2)
+        {
+            /* Peaks as permille of full scale (integer, keeps the log clean). A row
+             * like "FL FR C LFE BL BR = 812 790 0 0 0 0" is upmixed stereo (front
+             * only); non-zero centre/LFE/rears mean the game rendered real 5.1. */
+            DA_EVENT("hb: cb=%u voices=%d buf=%d cap=%d xruns=%d ch[FL FR C LFE BL BR]="
+                     " %d %d %d %d %d %d", mx->cb_count, mx->nvoices,
+                     AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
+                     AAudioStream_getXRunCount(aq),
+                     (int)(mx->ch_peak[0]*1000.0f), (int)(mx->ch_peak[1]*1000.0f),
+                     (int)(mx->ch_peak[2]*1000.0f), (int)(mx->ch_peak[3]*1000.0f),
+                     (int)(mx->ch_peak[4]*1000.0f), (int)(mx->ch_peak[5]*1000.0f));
+            memset(mx->ch_peak, 0, sizeof(mx->ch_peak));
+        }
+        else
+            DA_EVENT("hb: cb=%u voices=%d buf=%d cap=%d xruns=%d", mx->cb_count, mx->nvoices,
+                     AAudioStream_getBufferSizeInFrames(aq), AAudioStream_getBufferCapacityInFrames(aq),
+                     AAudioStream_getXRunCount(aq));
+    }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
