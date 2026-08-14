@@ -253,3 +253,120 @@ Both shipped with release + diagnostics builds, sdk28 and sdk35.
 5. Parked: cross-Proton-layer compat (works 11.0-5, `STATUS_DLL_NOT_FOUND` on
    11.0-3, cause unresolved). Downmix headroom, route rate/burst re-derive,
    Spatializer, mic capture. Mali untested. Ninja Gaiden untested.
+
+---
+
+## 2026-08-14 — adaptive DECAY: the buffer can come back down (branch, unmerged)
+
+Branch `feat/adaptive-decay` (`e55375b`, off `main` `3d78ffc`). Answers a direct
+question: can a target latency be set at launch and *adapted to* during play?
+Before this, no -- `BF` was only a starting point and `MBF` a ceiling, and the
+loop moved one way. Growth is now reversible.
+
+### What it does
+After 10 s (`DA_DECAY_QUIET_NS`) with no xrun climb, hand one burst back.
+
+Two guards, because naive shrinking oscillates (shrink -> underrun -> grow ->
+shrink), each cycle an audible click -- the reason Oboe's `LatencyTuner` refuses
+to shrink at all:
+
+1. **Floor = the size the stream OPENED at** (`base_buf_frames`, read back
+   post-open so it is a size AAudio actually rounds to). Decay can only undo
+   growth; it can never probe below what the launch config asked for. A rebuild
+   re-runs open, so a recovered stream starts low rather than inheriting growth.
+2. **Punishment.** An xrun within 5 s (`DA_DECAY_PUNISH_NS`) of a step down
+   means that step went too far: the level we climbed back to becomes the new
+   floor (`decay_floor`) and the quiet period doubles, capped at 32x (~5 min).
+   Once the floor is reached `cur > floor` stops holding and the loop quiesces,
+   so a title that needs headroom settles after a probe or two.
+
+Suspension is not calm: the freeze re-baseline path also restarts both decay
+timers, so backgrounded wall-clock cannot buy a step down on resume.
+
+`BANNER_AUDIO_DIRECT_DECAY=0` restores grow-only. Defaults ON -- the floor
+guarantee bounds the worst case to handing back latency that growth took.
+Floor discovery logs via `DA_EVENT`; individual steps are TRACE only.
+
+### NOT YET DONE
+- **Device test.** Needs a title that actually grows -- DiRT 3 loading is the
+  known repro (2568 underruns during load, then hours of smooth play holding the
+  inflated buffer). Confirm BOTH paths: reclaim after a transient, AND the
+  punished floor on a title that cannot hold the lower level. Per standing rule,
+  test the OFF state (`DECAY=0`) too.
+- **UI.** Deliberately left for a follow-up discussion on where it belongs in
+  the app (preset rung vs. its own control, and whether a ms-valued "target
+  latency" box is honest given ~21 ms of the measured 25 ms is AudioFlinger's
+  output latency, which the driver does not control).
+- Not merged, not tagged, not in any Proton layer.
+
+## 2026-08-14 (later) — full env control: ms latency + 9 more knobs (same branch)
+
+`dfa2cb7` (ms) + `401bf36` (the nine). Same branch `feat/adaptive-decay`, still
+unmerged and still untested on device.
+
+### Millisecond latency, with no UI
+`_MS` / `_MAXMS` mirror `_BF` / `_MBF` in milliseconds and are read LAST so they
+win. That precedence is load-bearing: `applyDirectAudioConfig` writes `_BF` into
+the env from the selected preset on EVERY launch, so a hand-typed frame count
+loses to the preset every time. Nothing but a person sets `_MS`.
+
+ms->frames conversion happens AFTER open, not at config read, because it needs
+the device burst. Rounds UP to a burst multiple (never below one burst): asking
+5 ms on a 4 ms-burst device gives 8 ms. Rounding down under-serves a burst and
+underruns; not rounding leaves decay chasing a size the stream cannot hold.
+
+`_MS` is also the decay floor, so "target a latency and adapt around it" is now
+literally true rather than aspirational.
+
+### The nine
+| knob | was | why it matters |
+|---|---|---|
+| `_PERIOD_MS` / `_MINPERIOD_MS` | `def_period` 10 ms / `min_period` 5 ms, compiled in | **the guest half of latency** - `get_latency` = buffer + period, and games size their buffers from the reported period. Every other knob steered only the AAudio half. Read at process attach: `get_device_period` is asked before any stream exists. min clamped to def (WASAPI contract). |
+| `_EXCLUSIVE` | sharing mode hardcoded SHARED | never-tested lever; EXCLUSIVE can go lower where granted, AAudio falls back silently - hence the open log now reports GRANTED perf + sharing, not requested |
+| `_WATCHDOG` / `_STALL_MS` | watchdog always on, 1 s | could not be A/B'd or its off state tested |
+| `_DECAY_QUIET_MS` / `_DECAY_PUNISH_MS` / `_DECAY_MAXBACKOFF` | 10 s / 5 s / 32x | all three were reasoned guesses; now tunable in one device session instead of five build cycles |
+| `_LOG` | diagnostics build only | heartbeats + growth + decay steps on a RELEASE build (`DA_LOG` = `DA_EVENT` behind the flag). Field diagnosis with no special binary. |
+
+Parsing rule: `<= 0` means "not set" and falls back to the built-in, so a
+malformed value can never request a 0 ms timeout or a zero-length buffer.
+`_WATCHDOG` is the exception (boolean, 0 is an answer).
+
+### Deliberately NOT exposed
+Mix format, output rate, channel count, AAudio usage tag, device pinning
+(`setDeviceId` is still never called), downmix gain, adaptive step size. Each
+changes what the driver DOES rather than how it is tuned, and each belongs to a
+roadmap item with its own device test.
+
+### Still open
+Device test for everything on this branch. The app also needs a plumbing fix:
+`persistAudioToShortcut` drops EVERY `BANNER_AUDIO_DIRECT_*` token and re-emits
+only the six keys it knows, so hand-typed `_MS`/`_MAXMS`/`_DECAY` survive
+launches but are silently deleted the first time the in-game audio cog is
+applied. Fix = drop only the keys being rewritten.
+
+## 2026-08-14 (later still) — shipping defaults changed: 83 ms -> 33 ms total
+
+Compiled-in defaults, used whenever a host sets no buffer config at all:
+
+| | was | now |
+|---|---|---|
+| start buffer | 3000 fr / 62.5 ms (`RATE/16`) | **576 fr / 12 ms** (`DA_DEFAULT_MS`) |
+| **total latency** | **83 ms** | **33 ms** |
+| capacity / ceiling | 12000 fr / 250 ms (`RATE/4`) | **4800 fr / 100 ms** (`DA_DEFAULT_MAX_MS`) |
+
+12 ms is the highest sustained floor in the 7-game sweep - the smallest buffer no
+tested title had to grow away from, so a fresh launch neither crackles nor runs
+adaptive on its first loading screen. NOT one burst (25 ms total): five of seven
+titles held it but GoW needed 8 ms and DiRT 3 needed 12 ms, and DiRT 3 took 2568
+underruns during loading before settling. n=1 device, and hardware with a
+256-frame burst cannot do 4 ms at all. One burst stays the right opt-in.
+
+The default goes through the same ms->burst-rounding path as `_MS`, so it lands
+on a burst boundary on hardware whose burst is not 192.
+
+Precedence is now: `_MS` > `_BF` > `DA_DEFAULT_MS`.
+
+**This matters most for hosts that bundle the driver and wire no env at all** -
+GameNative gets the new default directly. Bannerlator does NOT: every non-custom
+preset writes `_BF`, so it keeps its 62.5 ms "stable" default until the app-side
+preset rework (roadmap item 0) lands.
