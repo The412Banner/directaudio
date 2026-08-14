@@ -100,6 +100,7 @@ struct directaudio_stream
 
     /* adaptive buffer control (ported from the ALSA/PA adaptive stacks) */
     BOOL adaptive;
+    BOOL decay;                  /* let a grown buffer come back down when calm */
     int32_t target_buf_frames;   /* initial buffer target, 0 = leave default */
     int32_t max_buf_frames;      /* cap for adaptive growth, 0 = capacity */
     int32_t last_xrun;
@@ -304,6 +305,7 @@ struct directaudio_mixer
     int nvoices;
     aaudio_performance_mode_t perf;
     BOOL adaptive;
+    BOOL decay;
     int32_t max_buf_frames, target_buf_frames;
     int32_t last_xrun;
     int reopen_running;   /* a reopen worker thread is active */
@@ -319,6 +321,17 @@ struct directaudio_mixer
     UINT64 last_cb_ns;        /* monotonic ns of the most recent data callback */
     UINT64 wd_last_tick_ns;   /* monotonic ns of the previous watchdog tick */
     unsigned int wd_last_cb;  /* cb_count observed at the previous tick */
+
+    /* --- adaptive decay (see mixer_cb) ---------------------------------------
+     * Adaptive growth is one-way: the buffer climbs a burst per xrun and nothing
+     * ever gives it back, so a single rough patch - a loading screen, a shader
+     * compile, a route change - taxes latency for the rest of the session. These
+     * fields let a quiet stream walk back down to where it started. */
+    int32_t base_buf_frames;  /* size right after open: decay never goes below it */
+    int32_t decay_floor;      /* lowest size that proved sustainable, 0 = none yet */
+    UINT64 last_xrun_ns;      /* monotonic ns of the most recent xrun climb */
+    UINT64 last_decay_ns;     /* monotonic ns of the most recent step down */
+    unsigned int decay_backoff; /* quiet-period multiplier, doubles when punished */
 };
 
 /* Event-level logging, ALWAYS ON. Only fires when the audio output is rebuilt -
@@ -330,6 +343,12 @@ struct directaudio_mixer
 
 #define DA_FREEZE_GAP_NS  500000000ull   /* tick gap this large => guest was suspended */
 #define DA_CB_STALL_NS   1000000000ull   /* callback silent this long => stream is dead */
+
+/* Decay pacing. Slow on purpose: every step down is a bet that the load which
+ * forced the buffer up is gone, and a lost bet costs an audible click. */
+#define DA_DECAY_QUIET_NS  10000000000ull /* clean for this long => try one step down */
+#define DA_DECAY_PUNISH_NS  5000000000ull /* xrun this soon after a step => stepped too far */
+#define DA_DECAY_MAX_BACKOFF 32           /* caps the retry interval at ~5 min */
 
 static inline UINT64 da_now_ns(void)
 {
@@ -463,6 +482,7 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
     struct directaudio_mixer *mx = user;
     float *out = audioData;
     int32_t i, n2 = numFrames * MIX_OUT_CHANNELS;
+    UINT64 now;
 
     memset(out, 0, (size_t)n2 * sizeof(float));
 
@@ -480,8 +500,8 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
     /* Liveness for the watchdog. This MUST be unconditional - it used to be
      * folded into the TRACE_ON() test below, so with tracing off it never
      * advanced and a dead callback was indistinguishable from a live one. */
+    now = da_now_ns();
     {
-        UINT64 now = da_now_ns();
         UINT64 prev = __atomic_exchange_n(&mx->last_cb_ns, now, __ATOMIC_SEQ_CST);
 
         /* Coming back from a suspension (app backgrounded => guest SIGSTOPped),
@@ -490,7 +510,14 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
          * few background/foreground cycles inflate the buffer permanently
          * (observed: 192 -> 5568 frames, 4 ms -> 116 ms, and growth never shrinks). */
         if (prev && now - prev > DA_FREEZE_GAP_NS)
+        {
             mx->last_xrun = AAudioStream_getXRunCount(aq);
+            /* The frozen wall-clock is not evidence of calm - no audio ran during
+             * it. Restart both decay timers so a long background does not buy an
+             * immediate step down the moment the guest resumes. */
+            mx->last_xrun_ns = now;
+            mx->last_decay_ns = now;
+        }
     }
     __atomic_add_fetch(&mx->cb_count, 1, __ATOMIC_SEQ_CST);
 
@@ -499,17 +526,62 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
     if (mx->adaptive)
     {
         int32_t xruns = AAudioStream_getXRunCount(aq);
+        int32_t burst = AAudioStream_getFramesPerBurst(aq);
+        int32_t cur = AAudioStream_getBufferSizeInFrames(aq);
+
         if (xruns > mx->last_xrun)
         {
-            int32_t burst = AAudioStream_getFramesPerBurst(aq);
-            int32_t cur = AAudioStream_getBufferSizeInFrames(aq);
             int32_t cap = AAudioStream_getBufferCapacityInFrames(aq);
             int32_t want = cur + (burst > 0 ? burst : 1);
 
             if (mx->max_buf_frames > 0 && want > mx->max_buf_frames) want = mx->max_buf_frames;
             if (want > cap) want = cap;
             if (want > cur) AAudioStream_setBufferSizeInFrames(aq, want);
+
+            /* An xrun landing right after a step down says that step went below
+             * what this title can hold here. Remember the level we had to come
+             * back up to and stop trying to go under it, so a game that genuinely
+             * needs headroom settles instead of clicking every quiet period. The
+             * attribution window is deliberately short; a mis-attributed spike
+             * only costs some reclaim, never correctness. */
+            if (mx->decay && mx->last_decay_ns &&
+                now - mx->last_decay_ns < DA_DECAY_PUNISH_NS)
+            {
+                if (want > mx->decay_floor)
+                {
+                    mx->decay_floor = want;
+                    DA_EVENT("decay floor: %d frames (%d ms) - not probing below it",
+                             want, want * 1000 / MIX_OUT_RATE);
+                }
+                if (mx->decay_backoff < DA_DECAY_MAX_BACKOFF) mx->decay_backoff *= 2;
+            }
             mx->last_xrun = xruns;
+            mx->last_xrun_ns = now;
+        }
+        else if (mx->decay && burst > 0)
+        {
+            /* Nothing has underrun for a while and the buffer sits above where it
+             * started, so give a burst back and see if it holds. The floor is the
+             * open-time size (which honours BANNER_AUDIO_DIRECT_BF), raised by any
+             * level already proven unsustainable: decay only ever undoes growth,
+             * it never probes below the latency the launch config asked for. */
+            UINT64 quiet = DA_DECAY_QUIET_NS * mx->decay_backoff;
+            int32_t floor = mx->base_buf_frames;
+
+            if (mx->decay_floor > floor) floor = mx->decay_floor;
+            if (cur > floor && mx->last_xrun_ns &&
+                now - mx->last_xrun_ns > quiet && now - mx->last_decay_ns > quiet)
+            {
+                int32_t want = cur - burst;
+
+                if (want < floor) want = floor;
+                if (want < cur)
+                {
+                    AAudioStream_setBufferSizeInFrames(aq, want);
+                    mx->last_decay_ns = now;
+                    TRACE("decay: buf %d -> %d frames (floor %d)\n", cur, want, floor);
+                }
+            }
         }
     }
 
@@ -619,6 +691,17 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     }
     mx->last_xrun = AAudioStream_getXRunCount(aq);
 
+    /* Decay baseline for THIS stream. Read back rather than reusing `want`: AAudio
+     * rounds the request to a burst multiple, and the floor has to be a size the
+     * stream can actually be set to or decay would chase a value it never reaches.
+     * A rebuild (route change, watchdog) re-runs this, which is why a recovered
+     * stream starts low again instead of inheriting the old stream's growth. */
+    mx->base_buf_frames = AAudioStream_getBufferSizeInFrames(aq);
+    mx->decay_floor = 0;
+    mx->decay_backoff = 1;
+    mx->last_xrun_ns = da_now_ns();
+    mx->last_decay_ns = mx->last_xrun_ns;
+
     r = AAudioStream_requestStart(aq);
     if (r != AAUDIO_OK)
     {
@@ -700,6 +783,7 @@ static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
         return AAUDIO_OK;
     mx->perf = cfg->aa_perf;
     mx->adaptive = cfg->adaptive;
+    mx->decay = cfg->decay;
     mx->max_buf_frames = cfg->max_buf_frames;
     mx->target_buf_frames = cfg->target_buf_frames;
     return mixer_open_stream(mx, &mx->aq);
@@ -758,6 +842,11 @@ static void read_config_from_env(struct directaudio_stream *stream)
      * buffers are incompatible with the low-latency fast path.) */
     stream->aa_perf = AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
     stream->adaptive = TRUE;
+    /* Decay defaults ON. It cannot make the buffer smaller than the launch config
+     * asked for, so the worst it can do is hand back latency that growth took -
+     * and it stops probing once a title proves it needs the headroom. Set
+     * BANNER_AUDIO_DIRECT_DECAY=0 for the old grow-only behaviour. */
+    stream->decay = TRUE;
     stream->target_buf_frames = 0;
     stream->max_buf_frames = 0;
 
@@ -769,6 +858,7 @@ static void read_config_from_env(struct directaudio_stream *stream)
         else stream->aa_perf = AAUDIO_PERFORMANCE_MODE_NONE;
     }
     if ((e = getenv("BANNER_AUDIO_DIRECT_ADAPTIVE"))) stream->adaptive = atoi(e) != 0;
+    if ((e = getenv("BANNER_AUDIO_DIRECT_DECAY"))) stream->decay = atoi(e) != 0;
     if ((e = getenv("BANNER_AUDIO_DIRECT_BF"))) stream->target_buf_frames = atoi(e);
     if ((e = getenv("BANNER_AUDIO_DIRECT_MBF"))) stream->max_buf_frames = atoi(e);
 }

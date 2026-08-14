@@ -70,7 +70,7 @@ The last two could not sustain 4 ms and **found their own floor** — see below.
 
 A fixed buffer is the wrong shape for this problem. Too small and a game under box64/FEX + DXVK crackles the moment a GPU submission stalls; too large and everything is needlessly late. DirectAudio starts at the requested size and **grows only in response to real underruns**, one burst at a time, up to the device capacity:
 
-- **Monotonic.** It never shrinks mid-stream. Shrinking oscillates — shrink, underrun, grow, shrink — and each cycle is an audible click. This is the same rule Google's Oboe `LatencyTuner` follows.
+- **Reclaims when calm.** Growth used to be one-way, so a single loading screen taxed latency for the whole session. After 10 s with no underrun the engine gives one burst back and sees if it holds. Naive shrinking oscillates — shrink, underrun, grow, shrink — and each cycle is an audible click, which is why Google's Oboe `LatencyTuner` refuses to shrink at all; two guards make it safe here. **It never goes below the size the stream opened at**, so it can only undo growth, never undercut the launch config. And an underrun within 5 s of a step down marks that level unsustainable for this title: the engine stops probing below it and doubles its patience, up to ~5 minutes. A game that genuinely needs headroom settles after a probe or two instead of clicking forever.
 - **Edge-triggered.** It reacts to a *rise* in AAudio's xrun counter, not its absolute value, so one bad moment during level loading doesn't permanently inflate the buffer.
 - **Suspension-aware.** While the guest is frozen (app backgrounded) the xrun counter climbs regardless — that is not timing pressure. The engine re-baselines instead of growing, so background/foreground cycles don't ratchet latency upward.
 - **Free.** A couple of integer comparisons per callback, on the audio thread.
@@ -122,6 +122,7 @@ Read from the environment at stream open:
 |---|---|
 | `BANNER_AUDIO_DIRECT_PERF` | `0` NONE · `1` LOW_LATENCY *(default)* · `2` POWER_SAVING |
 | `BANNER_AUDIO_DIRECT_ADAPTIVE` | `1` adaptive growth *(default)* · `0` fixed buffer |
+| `BANNER_AUDIO_DIRECT_DECAY` | `1` reclaim latency when calm *(default)* · `0` grow-only |
 | `BANNER_AUDIO_DIRECT_BF` | initial buffer in frames (`0` = let AAudio choose) |
 | `BANNER_AUDIO_DIRECT_MBF` | cap for adaptive growth (`0` = device capacity) |
 
