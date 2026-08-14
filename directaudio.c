@@ -360,7 +360,7 @@ struct directaudio_mixer
     int32_t base_buf_frames;  /* size right after open: decay never goes below it */
     int32_t decay_floor;      /* lowest size that proved sustainable, 0 = none yet */
     UINT64 last_xrun_ns;      /* monotonic ns of the most recent xrun climb */
-    UINT64 last_decay_ns;     /* monotonic ns of the most recent step down */
+    UINT64 last_decay_ns;     /* monotonic ns of the most recent step down; 0 = none yet */
     unsigned int decay_backoff; /* quiet-period multiplier, doubles when punished */
 };
 
@@ -559,10 +559,11 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
         {
             mx->last_xrun = AAudioStream_getXRunCount(aq);
             /* The frozen wall-clock is not evidence of calm - no audio ran during
-             * it. Restart both decay timers so a long background does not buy an
-             * immediate step down the moment the guest resumes. */
+             * it - so restart the quiet timer and make the guest earn a step down
+             * again. Only last_xrun_ns: writing last_decay_ns here would forge a
+             * decay step that never happened and hand the next few underruns to
+             * the punishment branch below. */
             mx->last_xrun_ns = now;
-            mx->last_decay_ns = now;
         }
     }
     __atomic_add_fetch(&mx->cb_count, 1, __ATOMIC_SEQ_CST);
@@ -617,7 +618,8 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
 
             if (mx->decay_floor > floor) floor = mx->decay_floor;
             if (cur > floor && mx->last_xrun_ns &&
-                now - mx->last_xrun_ns > quiet && now - mx->last_decay_ns > quiet)
+                now - mx->last_xrun_ns > quiet &&
+                (!mx->last_decay_ns || now - mx->last_decay_ns > quiet))
             {
                 int32_t want = cur - burst;
 
@@ -784,7 +786,13 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     mx->decay_floor = 0;
     mx->decay_backoff = 1;
     mx->last_xrun_ns = da_now_ns();
-    mx->last_decay_ns = mx->last_xrun_ns;
+    /* 0, NOT the open time. Seeding this with "now" made every underrun in the
+     * first DA_DECAY_PUNISH_NS look like the aftermath of a step down that had
+     * never been taken - and a title's loading screen underruns land in exactly
+     * that window. DEVICE-PROVEN 2026-08-14: DiRT 3 logged two "decay floor"
+     * lines 0.13 s and 3 s after open, pinning the floor at its startup buffer
+     * and disabling decay for the whole session. */
+    mx->last_decay_ns = 0;
 
     /* One line per stream open, so a user who set a latency by hand can confirm
      * what the device actually granted instead of guessing. The buffer is the
