@@ -103,6 +103,7 @@ struct directaudio_stream
     BOOL decay;                  /* let a grown buffer come back down when calm */
     int32_t target_buf_frames;   /* initial buffer target, 0 = leave default */
     int32_t max_buf_frames;      /* cap for adaptive growth, 0 = capacity */
+    int32_t target_ms, max_ms;   /* same two in ms; win over the frame forms */
     int32_t last_xrun;
 
     /* software gain (AAudio NDK has no per-stream volume) */
@@ -307,6 +308,7 @@ struct directaudio_mixer
     BOOL adaptive;
     BOOL decay;
     int32_t max_buf_frames, target_buf_frames;
+    int32_t target_ms;    /* ms form of the target, rounded to a burst at open */
     int32_t last_xrun;
     int reopen_running;   /* a reopen worker thread is active */
     int reopen_redo;      /* a reopen was requested; consumed by the worker */
@@ -684,7 +686,26 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
 
     {
         int32_t cap = AAudioStream_getBufferCapacityInFrames(aq);
-        int32_t want = mx->target_buf_frames > 0 ? mx->target_buf_frames : MIX_OUT_RATE / 16; /* ~60 ms */
+        int32_t burst = AAudioStream_getFramesPerBurst(aq);
+        int32_t want;
+
+        if (mx->target_ms > 0)
+        {
+            /* A latency in ms only becomes a real size once the stream is open and
+             * the device's burst is known: AAudio serves whole bursts, so anything
+             * else is rounded anyway. Round UP to a burst multiple (never below one
+             * burst) so the request is a size the stream can actually hold - asking
+             * for 5 ms on a 4 ms-burst device means 8 ms, and it is better to say so
+             * in the log than to have decay chase a size that does not exist. */
+            want = mx->target_ms * MIX_OUT_RATE / 1000;
+            if (burst > 0)
+            {
+                int32_t n = (want + burst - 1) / burst;
+                want = (n < 1 ? 1 : n) * burst;
+            }
+        }
+        else want = mx->target_buf_frames > 0 ? mx->target_buf_frames : MIX_OUT_RATE / 16; /* ~60 ms */
+
         if (want > cap) want = cap;
         if (want > 0)
             AAudioStream_setBufferSizeInFrames(aq, want);
@@ -701,6 +722,14 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     mx->decay_backoff = 1;
     mx->last_xrun_ns = da_now_ns();
     mx->last_decay_ns = mx->last_xrun_ns;
+
+    /* One line per stream open, so a user who set a latency by hand can confirm
+     * what the device actually granted instead of guessing. The buffer is the
+     * part we control; AudioFlinger adds its own output latency on top (~21 ms on
+     * the reference device), which is why this says "buffer" and not "latency". */
+    DA_EVENT("open: buffer %d frames (%d ms) burst %d cap %d - device adds its own output latency",
+             mx->base_buf_frames, mx->base_buf_frames * 1000 / MIX_OUT_RATE,
+             AAudioStream_getFramesPerBurst(aq), AAudioStream_getBufferCapacityInFrames(aq));
 
     r = AAudioStream_requestStart(aq);
     if (r != AAUDIO_OK)
@@ -786,6 +815,10 @@ static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
     mx->decay = cfg->decay;
     mx->max_buf_frames = cfg->max_buf_frames;
     mx->target_buf_frames = cfg->target_buf_frames;
+    mx->target_ms = cfg->target_ms;
+    /* The ceiling needs no burst rounding - it only clamps growth and sizes the
+     * capacity request, both of which happen in whole frames. */
+    if (cfg->max_ms > 0) mx->max_buf_frames = cfg->max_ms * MIX_OUT_RATE / 1000;
     return mixer_open_stream(mx, &mx->aq);
 }
 
@@ -849,6 +882,8 @@ static void read_config_from_env(struct directaudio_stream *stream)
     stream->decay = TRUE;
     stream->target_buf_frames = 0;
     stream->max_buf_frames = 0;
+    stream->target_ms = 0;
+    stream->max_ms = 0;
 
     if ((e = getenv("BANNER_AUDIO_DIRECT_PERF")))
     {
@@ -861,6 +896,16 @@ static void read_config_from_env(struct directaudio_stream *stream)
     if ((e = getenv("BANNER_AUDIO_DIRECT_DECAY"))) stream->decay = atoi(e) != 0;
     if ((e = getenv("BANNER_AUDIO_DIRECT_BF"))) stream->target_buf_frames = atoi(e);
     if ((e = getenv("BANNER_AUDIO_DIRECT_MBF"))) stream->max_buf_frames = atoi(e);
+
+    /* Millisecond forms, for humans. These are read LAST and win over _BF/_MBF on
+     * purpose: the host app writes _BF itself from whichever preset is selected,
+     * so a hand-typed value in the same units would be in a fight it cannot win.
+     * _MS is only ever set by a person, so it takes precedence and gives a way to
+     * dial in latency with no UI support at all. Anything <= 0 is ignored, which
+     * makes an empty or malformed value fall back to the preset rather than to a
+     * zero-length buffer. */
+    if ((e = getenv("BANNER_AUDIO_DIRECT_MS")) && atoi(e) > 0) stream->target_ms = atoi(e);
+    if ((e = getenv("BANNER_AUDIO_DIRECT_MAXMS")) && atoi(e) > 0) stream->max_ms = atoi(e);
 }
 
 static NTSTATUS unix_process_attach(void *args)

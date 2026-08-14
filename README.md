@@ -125,6 +125,40 @@ Read from the environment at stream open:
 | `BANNER_AUDIO_DIRECT_DECAY` | `1` reclaim latency when calm *(default)* · `0` grow-only |
 | `BANNER_AUDIO_DIRECT_BF` | initial buffer in frames (`0` = let AAudio choose) |
 | `BANNER_AUDIO_DIRECT_MBF` | cap for adaptive growth (`0` = device capacity) |
+| `BANNER_AUDIO_DIRECT_MS` | initial buffer in **milliseconds** — wins over `_BF` |
+| `BANNER_AUDIO_DIRECT_MAXMS` | growth ceiling in **milliseconds** — wins over `_MBF` |
+
+#### Setting latency by hand, with no UI
+
+Put this in the game's environment (in Bannerlator: the shortcut's **Environment
+Variables** box — per-game, and it survives relaunches):
+
+```
+BANNER_AUDIO_DIRECT_MS=8 BANNER_AUDIO_DIRECT_MAXMS=60
+```
+
+That is the whole thing. `_MS` is the buffer the stream opens at and the level
+decay returns to; `_MAXMS` is as far as adaptive may climb when a title needs
+headroom. **`_MS` deliberately overrides `_BF`** — a host app writes `_BF` from
+whichever preset is selected, so a hand-typed frame count is in a fight with the
+preset it cannot win. Nothing writes `_MS` but a person.
+
+Two things to expect:
+
+- **The number gets rounded up.** AAudio serves whole bursts, so on a device with
+  a 4 ms burst, `_MS=5` becomes 8 ms. The driver rounds up rather than down —
+  under-serving a burst just underruns.
+- **It is the buffer, not the latency you hear.** Android adds its own output
+  latency on top — about 21 ms on the reference device, more on Bluetooth. A
+  4 ms buffer measured 25 ms end to end.
+
+Every stream open logs what was actually granted, so there is no guessing:
+
+```
+DirectAudio: open: buffer 384 frames (8 ms) burst 192 cap 12000 - device adds its own output latency
+```
+
+`adb logcat -s DirectAudio` shows it, on a release build, with no tracing enabled.
 
 ---
 
