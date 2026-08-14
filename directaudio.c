@@ -37,6 +37,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdio.h>
+#include <sys/stat.h>
 #include <android/log.h>
 
 /* Blank the API-availability annotation before including AAudio.h so the API-28
@@ -395,6 +397,18 @@ static unsigned int da_max_backoff = DA_DECAY_MAX_BACKOFF;
 static BOOL da_watchdog = TRUE;
 static int da_log = 0;
 
+/* --- live runtime config ("mailbox") --------------------------------------
+ * BANNER_AUDIO_DIRECT_RUNTIME names a flat KEY=VALUE file the host app rewrites
+ * when the in-game cog changes a setting. A low-frequency watcher thread (1 s,
+ * OFF the audio path) stats it and, on change, re-reads and rebuilds the stream
+ * via the existing reopen worker - so a setting change lands WITHOUT relaunch.
+ * Unset = feature off (env-at-launch behaviour, byte-identical to before). */
+static char   da_rt_path[512];       /* runtime file path; "" = disabled       */
+static UINT64 da_rt_mtime;           /* last-seen mtime (ns), 0 = never read    */
+static int    da_rt_ms    = -1;      /* live buffer override (ms), -1 = unset   */
+static int    da_rt_maxms = -1;      /* live growth ceiling (ms),  -1 = unset   */
+static int    da_rt_perf  = -1;      /* live perf mode 0/1/2,      -1 = unset   */
+
 /* Verbose logging in a RELEASE build. The diagnostics build stays the place for
  * per-call tracing, but a field report should not require shipping someone a
  * special binary to find out what the buffer is doing. Off unless asked. */
@@ -743,6 +757,72 @@ static void mixer_error_cb(AAudioStream *aq, void *user, aaudio_result_t error)
     mixer_request_reopen(mx, "stream error");
 }
 
+/* Overlay any live runtime overrides onto the mixer's config. Called at the top
+ * of every open (first open AND each reopen), so a mailbox change takes effect
+ * the next time the stream is built. An ms buffer wins over a frame count (as it
+ * does for the launch env), so clear target_buf_frames when ms is set. */
+static void da_apply_runtime_overrides(struct directaudio_mixer *mx)
+{
+    if (da_rt_ms   >= 0) { mx->target_ms = da_rt_ms; mx->target_buf_frames = 0; }
+    if (da_rt_maxms > 0)   mx->max_buf_frames = da_rt_maxms * MIX_OUT_RATE / 1000;
+    if (da_rt_perf >= 0)   mx->perf = da_rt_perf;
+}
+
+/* Parse the KEY=VALUE mailbox file into the override globals. Values <=0 (or out
+ * of range for perf) clear the override, so removing a line reverts to launch
+ * config. Tiny + only run when the file actually changed. */
+static void da_read_runtime_file(void)
+{
+    FILE *f;
+    char line[128];
+
+    if (!da_rt_path[0] || !(f = fopen(da_rt_path, "r"))) return;
+    while (fgets(line, sizeof(line), f))
+    {
+        char *eq = strchr(line, '=');
+        int v;
+
+        if (!eq) continue;
+        *eq = 0;
+        v = atoi(eq + 1);
+        if      (!strcmp(line, "MS"))    da_rt_ms    = v > 0 ? v : -1;
+        else if (!strcmp(line, "MAXMS")) da_rt_maxms = v > 0 ? v : -1;
+        else if (!strcmp(line, "PERF"))  da_rt_perf  = (v >= 0 && v <= 2) ? v : -1;
+    }
+    fclose(f);
+}
+
+/* The mailbox watcher: a lazy 1 s poll, OFF the real-time audio path. 99.9% of
+ * ticks are a single stat() that finds nothing changed; only an actual edit
+ * triggers a re-read + a live reopen. This is the whole cost of live control. */
+static void *da_config_watch_thread(void *unused)
+{
+    struct timespec iv = { 1, 0 };
+
+    (void)unused;
+    for (;;)
+    {
+        struct stat st;
+        UINT64 m;
+
+        nanosleep(&iv, NULL);
+        if (stat(da_rt_path, &st) != 0) continue;
+        m = (UINT64)st.st_mtim.tv_sec * 1000000000ull + (UINT64)st.st_mtim.tv_nsec;
+        if (m == da_rt_mtime) continue;          /* unchanged - just the cheap stat */
+        da_rt_mtime = m;
+
+        da_read_runtime_file();
+        DA_EVENT("runtime: reload ms=%d maxms=%d perf=%d", da_rt_ms, da_rt_maxms, da_rt_perf);
+
+        /* Live-apply only if a stream is up; otherwise the overrides land at the
+         * next open. The reopen worker rebuilds off the audio thread (~77 ms,
+         * inaudible), reading the fields da_apply_runtime_overrides just set. */
+        if (__atomic_load_n(&g_mixer.aq, __ATOMIC_SEQ_CST))
+            mixer_request_reopen(&g_mixer, "runtime config change");
+    }
+    return NULL;
+}
+
 /* open the one shared AAudio output: 48 kHz / float / stereo */
 static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStream **out)
 {
@@ -750,6 +830,7 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
     AAudioStream *aq = NULL;
     aaudio_result_t r;
 
+    da_apply_runtime_overrides(mx);   /* live mailbox overrides win over launch config */
     r = AAudio_createStreamBuilder(&builder);
     if (r != AAUDIO_OK || !builder)
         return r != AAUDIO_OK ? r : AAUDIO_ERROR_NO_MEMORY;
@@ -1071,6 +1152,17 @@ static void read_global_config_from_env(void)
         const char *e = getenv("BANNER_AUDIO_DIRECT_WATCHDOG");
         if (e && *e) da_watchdog = atoi(e) != 0;
     }
+    {
+        /* The live-config mailbox: a file the host app rewrites in-game. Read it
+         * once now so an existing file's values apply from the very first open;
+         * the watcher thread (started in process attach) tracks later edits. */
+        const char *e = getenv("BANNER_AUDIO_DIRECT_RUNTIME");
+        if (e && *e)
+        {
+            strncpy(da_rt_path, e, sizeof(da_rt_path) - 1);
+            da_read_runtime_file();
+        }
+    }
     if ((ms = env_pos("BANNER_AUDIO_DIRECT_STALL_MS", 0)) > 0)
         da_stall_ns = (UINT64)ms * 1000000ull;
     if ((ms = env_pos("BANNER_AUDIO_DIRECT_DECAY_QUIET_MS", 0)) > 0)
@@ -1101,6 +1193,16 @@ static NTSTATUS unix_process_attach(void *args)
     }
 #endif
     read_global_config_from_env();
+
+    /* Start the mailbox watcher only if a runtime file was configured. Detached:
+     * it runs for the process lifetime and is never joined. A failed spawn just
+     * means no live control (env-at-launch still works), so it is non-fatal. */
+    if (da_rt_path[0])
+    {
+        pthread_t th;
+        if (pthread_create(&th, NULL, da_config_watch_thread, NULL) == 0)
+            pthread_detach(th);
+    }
     return STATUS_SUCCESS;
 }
 
