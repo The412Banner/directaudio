@@ -37,7 +37,7 @@ The number that matters is **track latency** — what a player actually hears. I
 
 ### What it ships as
 
-With no host configuration the driver asks AAudio for `LOW_LATENCY` with adaptive buffering enabled, and lets AAudio pick the initial buffer. Hosts normally override this with a preset. Measured on the reference device (Adreno 750, Android 14, 192-frame burst):
+With no host configuration the driver asks AAudio for `LOW_LATENCY` with adaptive buffering and decay enabled, and opens at a 12 ms buffer — **33 ms total** on the reference device, since AudioFlinger adds 21 ms of its own. Hosts normally override this with a preset. Measured on the reference device (Adreno 750, Android 14, 192-frame burst):
 
 | requested buffer | track latency |
 |---|---|

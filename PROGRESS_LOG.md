@@ -343,3 +343,30 @@ Device test for everything on this branch. The app also needs a plumbing fix:
 only the six keys it knows, so hand-typed `_MS`/`_MAXMS`/`_DECAY` survive
 launches but are silently deleted the first time the in-game audio cog is
 applied. Fix = drop only the keys being rewritten.
+
+## 2026-08-14 (later still) — shipping defaults changed: 83 ms -> 33 ms total
+
+Compiled-in defaults, used whenever a host sets no buffer config at all:
+
+| | was | now |
+|---|---|---|
+| start buffer | 3000 fr / 62.5 ms (`RATE/16`) | **576 fr / 12 ms** (`DA_DEFAULT_MS`) |
+| **total latency** | **83 ms** | **33 ms** |
+| capacity / ceiling | 12000 fr / 250 ms (`RATE/4`) | **4800 fr / 100 ms** (`DA_DEFAULT_MAX_MS`) |
+
+12 ms is the highest sustained floor in the 7-game sweep - the smallest buffer no
+tested title had to grow away from, so a fresh launch neither crackles nor runs
+adaptive on its first loading screen. NOT one burst (25 ms total): five of seven
+titles held it but GoW needed 8 ms and DiRT 3 needed 12 ms, and DiRT 3 took 2568
+underruns during loading before settling. n=1 device, and hardware with a
+256-frame burst cannot do 4 ms at all. One burst stays the right opt-in.
+
+The default goes through the same ms->burst-rounding path as `_MS`, so it lands
+on a burst boundary on hardware whose burst is not 192.
+
+Precedence is now: `_MS` > `_BF` > `DA_DEFAULT_MS`.
+
+**This matters most for hosts that bundle the driver and wire no env at all** -
+GameNative gets the new default directly. Bannerlator does NOT: every non-custom
+preset writes `_BF`, so it keeps its 62.5 ms "stable" default until the app-side
+preset rework (roadmap item 0) lands.

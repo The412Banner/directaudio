@@ -304,6 +304,27 @@ static aaudio_format_t fmt_to_aaudio(const WAVEFORMATEX *fmt)
 #define MIX_OUT_CHANNELS 2
 #define MIX_MAX_VOICES   64
 
+/* Shipping defaults, used when the host sets no buffer config at all - which is
+ * the normal case for a host that bundles this driver without wiring the env up.
+ *
+ * 12 ms is the highest sustained floor observed across the 7-game sweep: the
+ * smallest buffer that NO tested title had to grow away from, so a fresh launch
+ * neither crackles nor runs adaptive on its first loading screen. On the
+ * reference device that reads as 33 ms total (AudioFlinger adds 21 ms), against
+ * 83 ms for the 62.5 ms default this replaces and ~121 ms for PulseAudio.
+ *
+ * NOT one burst (4 ms / 25 ms total): five of the seven sweep titles held it,
+ * but God of War needed 8 ms and DiRT 3 needed 12 ms, and DiRT 3 took 2568
+ * underruns during loading before settling. Those are audible. A default has to
+ * be safe on the worst device in a fleet we have exactly one sample of - the
+ * reference burst is 192 frames and hardware with a 256-frame burst cannot do
+ * 4 ms at all. One burst stays the right OPT-IN for a tuned title.
+ *
+ * The ceiling replaces a 250 ms capacity request. Nothing in the sweep sustained
+ * more than 12 ms, so 250 ms was a runaway rather than a safety net. */
+#define DA_DEFAULT_MS      12
+#define DA_DEFAULT_MAX_MS 100
+
 struct directaudio_mixer
 {
     pthread_mutex_t lock;
@@ -708,7 +729,8 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
      * output = far fewer xruns than N per-stream outputs, so a moderate initial
      * buffer stays low-latency. BANNER_AUDIO_DIRECT_MBF/_BF override. */
     {
-        int32_t cap_req = mx->max_buf_frames > 0 ? mx->max_buf_frames : MIX_OUT_RATE / 4; /* ~250 ms */
+        int32_t cap_req = mx->max_buf_frames > 0 ? mx->max_buf_frames
+                                                 : DA_DEFAULT_MAX_MS * MIX_OUT_RATE / 1000;
         if (cap_req > 0)
             AAudioStreamBuilder_setBufferCapacityInFrames(builder, cap_req);
     }
@@ -723,7 +745,13 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
         int32_t burst = AAudioStream_getFramesPerBurst(aq);
         int32_t want;
 
-        if (mx->target_ms > 0)
+        /* An explicit frame count wins only when no ms value was given; the ms form
+         * is what a person sets by hand, the frame form is what a host preset
+         * writes. With neither, fall back to the shipping default - also in ms, so
+         * it lands on a burst boundary on hardware whose burst is not ours. */
+        if (mx->target_buf_frames > 0 && mx->target_ms <= 0)
+            want = mx->target_buf_frames;
+        else
         {
             /* A latency in ms only becomes a real size once the stream is open and
              * the device's burst is known: AAudio serves whole bursts, so anything
@@ -731,14 +759,15 @@ static aaudio_result_t mixer_open_stream(struct directaudio_mixer *mx, AAudioStr
              * burst) so the request is a size the stream can actually hold - asking
              * for 5 ms on a 4 ms-burst device means 8 ms, and it is better to say so
              * in the log than to have decay chase a size that does not exist. */
-            want = mx->target_ms * MIX_OUT_RATE / 1000;
+            int32_t ms = mx->target_ms > 0 ? mx->target_ms : DA_DEFAULT_MS;
+
+            want = ms * MIX_OUT_RATE / 1000;
             if (burst > 0)
             {
                 int32_t n = (want + burst - 1) / burst;
                 want = (n < 1 ? 1 : n) * burst;
             }
         }
-        else want = mx->target_buf_frames > 0 ? mx->target_buf_frames : MIX_OUT_RATE / 16; /* ~60 ms */
 
         if (want > cap) want = cap;
         if (want > 0)
