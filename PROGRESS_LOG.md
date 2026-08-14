@@ -253,3 +253,48 @@ Both shipped with release + diagnostics builds, sdk28 and sdk35.
 5. Parked: cross-Proton-layer compat (works 11.0-5, `STATUS_DLL_NOT_FOUND` on
    11.0-3, cause unresolved). Downmix headroom, route rate/burst re-derive,
    Spatializer, mic capture. Mali untested. Ninja Gaiden untested.
+
+---
+
+## 2026-08-14 — adaptive DECAY: the buffer can come back down (branch, unmerged)
+
+Branch `feat/adaptive-decay` (`e55375b`, off `main` `3d78ffc`). Answers a direct
+question: can a target latency be set at launch and *adapted to* during play?
+Before this, no -- `BF` was only a starting point and `MBF` a ceiling, and the
+loop moved one way. Growth is now reversible.
+
+### What it does
+After 10 s (`DA_DECAY_QUIET_NS`) with no xrun climb, hand one burst back.
+
+Two guards, because naive shrinking oscillates (shrink -> underrun -> grow ->
+shrink), each cycle an audible click -- the reason Oboe's `LatencyTuner` refuses
+to shrink at all:
+
+1. **Floor = the size the stream OPENED at** (`base_buf_frames`, read back
+   post-open so it is a size AAudio actually rounds to). Decay can only undo
+   growth; it can never probe below what the launch config asked for. A rebuild
+   re-runs open, so a recovered stream starts low rather than inheriting growth.
+2. **Punishment.** An xrun within 5 s (`DA_DECAY_PUNISH_NS`) of a step down
+   means that step went too far: the level we climbed back to becomes the new
+   floor (`decay_floor`) and the quiet period doubles, capped at 32x (~5 min).
+   Once the floor is reached `cur > floor` stops holding and the loop quiesces,
+   so a title that needs headroom settles after a probe or two.
+
+Suspension is not calm: the freeze re-baseline path also restarts both decay
+timers, so backgrounded wall-clock cannot buy a step down on resume.
+
+`BANNER_AUDIO_DIRECT_DECAY=0` restores grow-only. Defaults ON -- the floor
+guarantee bounds the worst case to handing back latency that growth took.
+Floor discovery logs via `DA_EVENT`; individual steps are TRACE only.
+
+### NOT YET DONE
+- **Device test.** Needs a title that actually grows -- DiRT 3 loading is the
+  known repro (2568 underruns during load, then hours of smooth play holding the
+  inflated buffer). Confirm BOTH paths: reclaim after a transient, AND the
+  punished floor on a title that cannot hold the lower level. Per standing rule,
+  test the OFF state (`DECAY=0`) too.
+- **UI.** Deliberately left for a follow-up discussion on where it belongs in
+  the app (preset rung vs. its own control, and whether a ms-valued "target
+  latency" box is honest given ~21 ms of the measured 25 ms is AudioFlinger's
+  output latency, which the driver does not control).
+- Not merged, not tagged, not in any Proton layer.
