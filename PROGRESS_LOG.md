@@ -207,3 +207,49 @@ Device restored to the shipped release driver (`9817a941`).
    **NEVER `bf=192` on `low`** (it has `adaptive=false`).
 3. Downmix headroom, route rate/burst re-derive, Spatializer, mic capture.
 4. Mali untested. Ninja Gaiden untested. Upstream to GameNative needs a NEW PR (#7 merged).
+
+---
+
+## 2026-08-13 (end of day) — branch cleanup + where to pick up
+
+### Repo hygiene
+Branches 18 -> 13. Deleted only what was merged into main or superseded:
+`feat/directaudio-switching-usage`, `feat/fix-release-deadlock`,
+`fix/midi-notify-spin`, `fix/aaudio-callback-watchdog` (all merged);
+`feat/diagnostics`, `feat/diagnostics-v1.2`, `fix/aaudio-callback-watchdog-diag`
+(instrumentation carried forward). All 9 GoW investigation branches KEPT --
+they are the record of what was ruled out.
+
+**New permanent `diagnostics` branch** = main + one instrumentation commit.
+Refresh it with `git rebase main` after each release. This replaces the
+per-release naming that produced a new stale branch every time.
+
+Deleted SHAs (recoverable ~90d via `git push origin <sha>:refs/heads/<name>`):
+8d47e2d9 2acab88c a350c9d1 7b9affff 4a9ba787 d4e13b8e 774344aa
+
+### Shipped today
+- **v1.2** — `mmdevapi_midi_n` spin fix. Root cause of the long-running GoW
+  black screen; every DirectAudio title had been losing a CPU core since v1.
+- **v1.2.1** — dead AAudio data-callback watchdog. Fixes JT's permanent audio
+  loss on rapid background/foreground.
+Both shipped with release + diagnostics builds, sdk28 and sdk35.
+
+### PICK UP HERE (nothing is blocked)
+1. **Shipping gap (biggest).** `proton_11.0` carries no `dlls/winedirectaudio.drv`
+   at all, its mmdevapi `default_list` has no `directaudio`, and the submodule
+   pin on `feat/directaudio-submodule` is stale at `cd6b4a3`. A Proton rebuild
+   today ships NEITHER release -- everything on device is hot-swapped.
+2. **GameNative PR** joshuatam/GameNative#8 open (both tzst, JT chooses via the
+   `DIRECTAUDIO_ASSET` constant). When JT merges, utkarshdalal#1806 updates
+   itself -- it tracks his branch, no upstream action needed. Open question for
+   him: SDK 28 vs 35 for the bundled asset.
+3. **Preset rework** -- default `stable`->`auto` (62.5 -> 26 ms), add a
+   "Minimum" rung (`bf=192, adaptive=true`). NEVER `bf=192` on `low` -- it has
+   `adaptive=false` and every 25 ms result depended on adaptive.
+4. **Proton gate + runtime fallback.** Bannerlator offers DirectAudio on Proton
+   10 containers where the ABI mismatches. A version gate alone is NOT enough
+   (11.0-3 IS Proton 11 and still fails to load) -- needs a runtime fallback so
+   a failed init lands on pulse instead of leaving the container with no audio.
+5. Parked: cross-Proton-layer compat (works 11.0-5, `STATUS_DLL_NOT_FOUND` on
+   11.0-3, cause unresolved). Downmix headroom, route rate/burst re-derive,
+   Spatializer, mic capture. Mali untested. Ninja Gaiden untested.
