@@ -1159,7 +1159,11 @@ static void read_global_config_from_env(void)
         const char *e = getenv("BANNER_AUDIO_DIRECT_RUNTIME");
         if (e && *e)
         {
-            strncpy(da_rt_path, e, sizeof(da_rt_path) - 1);
+            /* Wine poisons strncpy; bounded memcpy + explicit NUL instead. */
+            size_t n = strlen(e);
+            if (n >= sizeof(da_rt_path)) n = sizeof(da_rt_path) - 1;
+            memcpy(da_rt_path, e, n);
+            da_rt_path[n] = 0;
             da_read_runtime_file();
         }
     }
