@@ -5,4 +5,5 @@ DELAYIMPORTS = winmm
 UNIX_LIBS = $(AAUDIO_LIBS) $(PTHREAD_LIBS) -llog
 
 SOURCES = \
-	directaudio.c
+	directaudio.c \
+	mmdevdrv.c

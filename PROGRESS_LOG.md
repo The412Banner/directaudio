@@ -1,5 +1,16 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-08-15 — Wine 10 ABI: PE side (`winedirectaudio.drv.spec` + `mmdevdrv.c`)
+
+Wine 10's build hard-requires `<module>.spec` and Wine 10's mmdevapi resolves the device-GUID mapping on the PE via
+`GetProcAddress(get_device_guid)` / `GetProcAddress(get_device_name_from_guid)` (mmdevapi_private.h DriverFuncs) —
+both absent on the P10 pin, so the Proton 10.0-4 v131 build failed `make` on the missing spec and CI shipped a 1 MB
+skeleton wcp. Fix on `feat/wine10-abi`:
+- `winedirectaudio.drv.spec`: `@ stdcall -private get_device_guid(long ptr ptr)` + `get_device_name_from_guid(ptr ptr ptr)`.
+- `mmdevdrv.c`: PE-only (no `#pragma makedep unix`) — DllMain (`__wine_init_unix_call`) + registry-backed GUID
+  persistence, ported from winecoreaudio.drv/mmdevdrv.c.
+- Wine 11 ABI needs neither (auto-generated zero-export PE stub; mmdevapi calls the unixlib only) — unchanged.
+
 ## 2026-08-14 — v1.3.1: live in-game config ("mailbox")
 
 `BANNER_AUDIO_DIRECT_RUNTIME=<file>` opts into live control: a flat KEY=VALUE mailbox (MS/MAXMS/PERF) the host
