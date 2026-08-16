@@ -19,7 +19,7 @@ name: build driver (arm64ec hot-swap artifacts)
 
 on:
   push:
-    branches: [ main, feat/wine10-standalone-ci ]   # TEMP: build branch for pre-tag proving; drop before merge to main
+    branches: [ main ]
     tags: [ 'directaudio-v*' ]
   pull_request:
   workflow_dispatch:
