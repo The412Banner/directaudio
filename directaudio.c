@@ -177,6 +177,10 @@ static NTSTATUS unix_not_implemented(void *args)
  * real blocking implementation. If winealsa fails to load, mmdevapi leaves
  * midi_driver zeroed and DriverProc returns early - no thread, no spin. Safe
  * either way. */
+#if !defined(WINE_MMDEVAPI_NO_MIDI_GET_DRIVER)
+/* Wine 10.x mmdevapi has no midi_get_driver unixlib slot (added in Wine 11);
+ * proton-wine's 10.0 tree defines WINE_MMDEVAPI_NO_MIDI_GET_DRIVER in
+ * configure.ac so this slot and its table entries are dropped there. */
 static NTSTATUS unix_midi_get_driver(void *args)
 {
     static const WCHAR driver[] = {'a','l','s','a',0};
@@ -184,6 +188,7 @@ static NTSTATUS unix_midi_get_driver(void *args)
     memcpy(args, driver, sizeof(driver));
     return STATUS_SUCCESS;
 }
+#endif /* WINE_MMDEVAPI_NO_MIDI_GET_DRIVER */
 
 /* Defence in depth: if DirectAudio ever does end up as the MIDI driver anyway,
  * exit the notify loop on the first iteration instead of spinning forever. */
@@ -2100,7 +2105,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     unix_test_connect,
     unix_is_started,
     unix_get_prop_value,
+#if !defined(WINE_MMDEVAPI_NO_MIDI_GET_DRIVER)
     unix_midi_get_driver,        /* midi_get_driver */
+#endif
     unix_not_implemented,        /* midi_init */
     unix_not_implemented,        /* midi_release */
     unix_midi_out_message,       /* midi_out_message */
@@ -2590,7 +2597,9 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     unix_wow64_test_connect,
     unix_is_started,
     unix_wow64_get_prop_value,
+#if !defined(WINE_MMDEVAPI_NO_MIDI_GET_DRIVER)
     unix_midi_get_driver,        /* midi_get_driver */
+#endif
     unix_not_implemented,        /* midi_init */
     unix_not_implemented,        /* midi_release */
     unix_midi_out_message,       /* midi_out_message */
