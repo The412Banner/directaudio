@@ -198,32 +198,40 @@ jobs:
           echo "=== driver build products ==="
           find dlls/winedirectaudio.drv -name 'winedirectaudio.*' ! -name '*.c' -exec ls -la {} +
 
-      - name: Collect + strip artifacts
+      - name: Collect + strip artifacts (complete 3-file set)
         working-directory: wine
         run: |
           set -e
           STRIP="$HOME/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           OUT="$GITHUB_WORKSPACE/out/${{ matrix.label }}"
-          mkdir -p "$OUT"
-          # Ship the arm64ec PE: Wine emits arm64ec module output into aarch64-windows/
-          # (the i386-windows/ build is the 32-bit PE and must never be shipped here).
-          # Prefer aarch64-windows explicitly; fall back to any .drv only if absent.
-          PE=$(find . -type f -path '*/aarch64-windows/winedirectaudio.drv' | head -1)
-          [ -n "$PE" ] || PE=$(find . -type f -name 'winedirectaudio.drv' | head -1)
-          SO=$(find . -type f -name 'winedirectaudio.so'  | head -1)
-          echo "PE=$PE"; echo "SO=$SO"
-          test -n "$PE" && test -n "$SO"   # fail loudly if either is missing
-          cp -v "$PE" "$SO" "$OUT/"
-          "$STRIP" --strip-all "$OUT/winedirectaudio.drv" 2>/dev/null || true
-          "$STRIP" --strip-all "$OUT/winedirectaudio.so"  2>/dev/null || true
-          echo "--- artifacts (${{ matrix.label }}) ---"; ls -la "$OUT"
-          file "$OUT"/* || true
+          mkdir -p "$OUT/aarch64-windows" "$OUT/i386-windows" "$OUT/aarch64-unix"
+          # A COMPLETE driver is THREE files, laid out to mirror the Proton layer so
+          # the whole set can be dropped straight onto lib/wine/:
+          #   aarch64-windows/winedirectaudio.drv  arm64ec PE — loaded by 64-bit guests
+          #   i386-windows/winedirectaudio.drv     32-bit PE  — loaded by 32-bit guests
+          #   aarch64-unix/winedirectaudio.so      bionic unixlib — the AAudio backend
+          # Both PE arches come from the one driver source; the build produced both.
+          PE64=$(find . -type f -path '*/aarch64-windows/winedirectaudio.drv' | head -1)
+          PE32=$(find . -type f -path '*/i386-windows/winedirectaudio.drv'    | head -1)
+          SO=$(find . -type f -name 'winedirectaudio.so' | head -1)
+          echo "PE64=$PE64"; echo "PE32=$PE32"; echo "SO=$SO"
+          test -n "$PE64" && test -n "$PE32" && test -n "$SO"   # all three required
+          cp -v "$PE64" "$OUT/aarch64-windows/winedirectaudio.drv"
+          cp -v "$PE32" "$OUT/i386-windows/winedirectaudio.drv"
+          cp -v "$SO"   "$OUT/aarch64-unix/winedirectaudio.so"
+          "$STRIP" --strip-all "$OUT/aarch64-windows/winedirectaudio.drv" 2>/dev/null || true
+          "$STRIP" --strip-all "$OUT/i386-windows/winedirectaudio.drv"    2>/dev/null || true
+          "$STRIP" --strip-all "$OUT/aarch64-unix/winedirectaudio.so"     2>/dev/null || true
+          echo "--- complete artifact set (${{ matrix.label }}) ---"
+          find "$OUT" -type f -exec ls -la {} +
+          echo "--- file(1) identification ---"
+          find "$OUT" -type f -exec file {} +
 
       - name: Upload hot-swap artifacts
         uses: actions/upload-artifact@v4
         with:
           name: directaudio-${{ matrix.label }}
-          path: out/${{ matrix.label }}/*
+          path: out/${{ matrix.label }}
           retention-days: 30
 
   release:
@@ -252,8 +260,15 @@ jobs:
           files: release/*
           body: |
             **DirectAudio hot-swap driver** — native Wine → Android AAudio (`winedirectaudio.drv`).
-            Two Wine ABIs × two page sizes. Swap into the matching device Proton layer's
-            `lib/wine/aarch64-windows/winedirectaudio.drv` + `lib/wine/aarch64-unix/winedirectaudio.so`.
+            Two Wine ABIs × two page sizes. Each zip is the **complete 3-file driver set**,
+            laid out to drop straight onto the device Proton layer's `lib/wine/`:
+            - `aarch64-windows/winedirectaudio.drv` — arm64ec PE, loaded for **64-bit** guest games
+            - `i386-windows/winedirectaudio.drv` — 32-bit PE, loaded for **32-bit** guest games
+            - `aarch64-unix/winedirectaudio.so` — bionic unixlib (the AAudio backend)
+
+            Which PE loads is decided by the **guest game's bitness**, not the device — a
+            complete set carries both so either game type gets audio. Match the ABI to the
+            layer's Wine version and the page size (sdk28 = 4KB, sdk35 = 16KB) to the device.
 
             **Wine 11.0** (`ge-proton11-5-bionic-staging`) — overlay onto Wine-11 layers:
             - `directaudio-wine11-arm64ec-sdk28.zip` — 4KB-page devices
