@@ -182,9 +182,14 @@ jobs:
           # make below. The script also applies the bionic + GE patches + configures.
           source build-scripts/build-step-arm64ec.sh ${{ matrix.page_flag }} --configure
           # Discover the exact build targets from the generated Makefile. PE files
-          # live in an arch-prefixed subdir (e.g. arm64ec-windows/); the unixlib .so
-          # sits at the module-dir root. (make on the bare dir name is a no-op.)
-          mapfile -t TGTS < <(grep -oE "dlls/winedirectaudio\.drv/([A-Za-z0-9_-]+/)?winedirectaudio\.(drv|so)" Makefile | sort -u)
+          # live in a per-arch subdir ({aarch64,i386}-windows/); the unixlib .so sits
+          # at the module-dir root. Match ONLY real targets: require the "-windows/"
+          # arch segment for the .drv, or the bare .so. This deliberately EXCLUDES the
+          # bare "dlls/winedirectaudio.drv/winedirectaudio.drv" string that Wine 10's
+          # Makefile carries (the PE .spec/importlib reference) — it is not a make
+          # target, and feeding it to make fails with "No rule to make target". The
+          # Wine 11 tree has no such bare reference, so its target set is unchanged.
+          mapfile -t TGTS < <(grep -oE "dlls/winedirectaudio\.drv/([A-Za-z0-9_-]+-windows/winedirectaudio\.drv|winedirectaudio\.so)" Makefile | sort -u)
           echo "discovered targets:"; printf '  %s\n' "${TGTS[@]}"
           test "${#TGTS[@]}" -ge 2   # expect at least the PE + the unixlib
           echo "::group::make driver"
@@ -200,7 +205,11 @@ jobs:
           STRIP="$HOME/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           OUT="$GITHUB_WORKSPACE/out/${{ matrix.label }}"
           mkdir -p "$OUT"
-          PE=$(find . -type f -name 'winedirectaudio.drv' | head -1)
+          # Ship the arm64ec PE: Wine emits arm64ec module output into aarch64-windows/
+          # (the i386-windows/ build is the 32-bit PE and must never be shipped here).
+          # Prefer aarch64-windows explicitly; fall back to any .drv only if absent.
+          PE=$(find . -type f -path '*/aarch64-windows/winedirectaudio.drv' | head -1)
+          [ -n "$PE" ] || PE=$(find . -type f -name 'winedirectaudio.drv' | head -1)
           SO=$(find . -type f -name 'winedirectaudio.so'  | head -1)
           echo "PE=$PE"; echo "SO=$SO"
           test -n "$PE" && test -n "$SO"   # fail loudly if either is missing
