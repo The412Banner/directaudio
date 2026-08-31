@@ -116,7 +116,9 @@ This is event-level only — a handful of lines per session. Per-callback heartb
 
 **Verified:** D3D9 / D3D11 / D3D12+VKD3D, and WASAPI / FAudio / XAudio2 / DirectSound. Tested on a single device (Adreno 750, Android 14) — **Mali GPUs are untested**.
 
-**Not yet supported:** microphone capture, true multichannel output (everything is downmixed to stereo).
+**In progress — microphone capture (`BANNER_AUDIO_DIRECT_MIC=1`, off by default).** A WASAPI capture endpoint backed by an AAudio `INPUT` stream (48 kHz / float / stereo, `VOICE_COMMUNICATION` preset for platform echo-cancel / noise-suppress / auto-gain) so a Windows game can record the Android mic — e.g. Source-engine voice chat through the genuine Steam voice API. It is the mirror of the render mixer: one shared input stream, opened lazily on the first capture stream and started only on the first `Start`, distributing captured PCM to each capture voice. **Default off is byte-identical to the render-only build** — zero capture endpoints, every capture op `AUDCLNT_E_DEVICE_INVALIDATED` — because a capture endpoint a game can enumerate but not open black-screens titles that probe the mic at startup (God of War, DiRT 3). Turn it on only for a title that wants the mic. Built; on-device verification pending.
+
+**Not yet supported:** true multichannel output (everything is downmixed to stereo).
 
 ### Proton layers with DirectAudio built in
 
@@ -177,6 +179,7 @@ attach:
 | `BANNER_AUDIO_DIRECT_MINPERIOD_MS` | minimum period reported to the guest *(default 5)* |
 | `BANNER_AUDIO_DIRECT_EXCLUSIVE` | `1` request an EXCLUSIVE AAudio stream · `0` SHARED *(default)* |
 | `BANNER_AUDIO_DIRECT_WATCHDOG` | `1` dead-callback watchdog *(default)* · `0` off |
+| `BANNER_AUDIO_DIRECT_MIC` | `1` expose a microphone (AAudio `INPUT`) capture endpoint · `0` no capture endpoint *(default)* |
 | `BANNER_AUDIO_DIRECT_STALL_MS` | callback silence before a rebuild *(default 1000)* |
 | `BANNER_AUDIO_DIRECT_DECAY_QUIET_MS` | calm required before a step down *(default 10000)* |
 | `BANNER_AUDIO_DIRECT_DECAY_PUNISH_MS` | window in which an underrun blames the last step *(default 5000)* |
@@ -282,7 +285,7 @@ Remaining, in order:
 |---|---|---|
 | 1 | **Route-change format handling** | A new route can have a different sample rate (Bluetooth is often 44.1 kHz where the speaker is 48) and a very different burst size. The rebuild needs to re-derive the resampler ratio and re-apply adaptive sizing, and coalesce repeated disconnect events. |
 | 2 | **Real surround** | Negotiate 6/8 channels and pass through where the device grants it (HDMI, USB DAC). On Android 13+, hand AAudio a real 5.1 stream with a channel mask and let the platform **Spatializer** do binaural rendering on headphones — genuine surround with the DSP cost carried by Android. With headroom now handled, this is the next real audio-quality win. |
-| 3 | **Microphone capture** | A second AAudio stream in the `INPUT` direction; the capture half of the vtable is already wired but no capture endpoint is exposed. Opened lazily so single-player titles never pay for it. **This is the one item that could threaten the latency floor** — on some devices an input stream knocks the output off the fast path, so it needs measuring rather than assuming. |
+| 3 | **Microphone capture** *(built, behind `BANNER_AUDIO_DIRECT_MIC=1`; on-device verification pending)* | A second AAudio stream in the `INPUT` direction (48 kHz / float / stereo, `VOICE_COMMUNICATION` preset), the mirror of the render mixer: one shared input, opened lazily on the first capture stream, started on the first `Start`, distributing captured PCM to each capture voice's ring. Off by default because an enumerable-but-unopenable capture endpoint black-screens titles that probe the mic at startup. **The one item that could threaten the latency floor** — on some devices an input stream knocks the output off the fast path, so it still needs measuring on device rather than assuming. |
 
 Also wanted: verification on Mali hardware, and a lower preset rung in host apps so the 4 ms buffer is reachable from a UI rather than only by environment variable.
 

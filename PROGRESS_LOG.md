@@ -1,5 +1,45 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-08-31 — feat/mic-capture: microphone capture (built, device test pending)
+
+Completes the parked capture half. A WASAPI capture endpoint backed by an AAudio `INPUT` stream, gated behind a
+new **`BANNER_AUDIO_DIRECT_MIC`** knob (env-read once at process attach, boolean like `_WATCHDOG`; default off).
+Unset = byte-identical to the render-only build: `get_endpoint_ids` exposes 0 capture endpoints, every capture op
+returns `AUDCLNT_E_DEVICE_INVALIDATED`, no AAudio input is ever touched — so no existing title changes behaviour,
+which is the safety mechanism against the GoW/DiRT-3 black screen (an enumerable-but-unopenable capture endpoint
+makes them abandon audio init). `=1` exposes one `eCapture` endpoint, capture `create_stream` succeeds, and PCM
+flows.
+
+Design mirrors the render mixer, inverted. ONE shared AAudio input (48 kHz / float / stereo,
+`AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION` for platform AEC/NS/AGC — weak-linked like `setUsage` for API 26/27),
+opened **lazily** on the first capture `create_stream` (so enumeration never opens the mic) and **started** only
+on the first `Start` (mic goes hot no earlier than the game records; requestStart is deferred out of `unix_start`
+past the `stream->lock` release so `cap->lock` never inverts against the callback's `cap->lock → v->lock` order).
+Its data callback is the producer: per registered capture voice it rate-converts (carried fractional position;
+a straight copy at 48 kHz, the mix-format path Steam voice uses), folds channels, writes the client sample format,
+and drops the oldest frame on overrun. The captured ring reuses the render ring fields (`local_buffer`,
+`{lcl,wri}_offs_frames`, `held_frames`, `written_frames`, `getbuf_last`, `tmp_buffer`) with producer/consumer
+roles swapped, exactly as winecoreaudio does — so `create_stream`, the per-period `stream->event` the timer loop
+already raises, and the vtable are shared. `get_capture_buffer` serves period-sized chunks (linearising a wrapped
+chunk via `tmp_buffer`, `zero_bits`-allocated so it is 32-bit-addressable for wow64) and returns
+`AUDCLNT_S_BUFFER_EMPTY` until a full period is held; `release_capture_buffer` advances the read side;
+`get_next_packet_size` reports a period once one is held. Route-change recovery reuses the mixer's single-flight
+reopen pattern (`VOICE_COMMUNICATION` mic + BT headset is a primary use case). Last capture voice gone → the mic
+is `requestStop`ped (recording indicator clears) but the stream stays open for reuse. wow64 `get_capture_buffer`
+thunk fully wired (data/frames/flags/devpos/qpcpos); native + wow64 vtables and param structs unchanged in shape.
+Render path byte-for-byte unchanged when the mic is off.
+
+Config path (must match the app side): `getenv("BANNER_AUDIO_DIRECT_MIC")` in `read_global_config_from_env`,
+set in the container/shortcut env like every other `BANNER_AUDIO_DIRECT_*` env knob. NOT a live mailbox key —
+endpoint enumeration is a one-time startup event, so a mid-session toggle could not retroactively expose it.
+
+Open risks (device test): the input stream's effect on the render latency floor (README flags this as the item
+that could knock the output off the fast path — needs measuring, not assuming); AAudio input open under FEX is
+untested; and if `capture_open_stream` fails on a route change the reopen keeps the dead stream (no input
+watchdog yet, unlike the render side). TEST: hot-swap the 3-file set, `BANNER_AUDIO_DIRECT_MIC=1` +
+`BANNER_AUDIO_DIRECT_LOG=1` on a Source title, grant RECORD_AUDIO, and confirm `capture open/start` in logcat +
+voice reaching a VAC server.
+
 ## 2026-08-14 — v1.3.1: live in-game config ("mailbox")
 
 `BANNER_AUDIO_DIRECT_RUNTIME=<file>` opts into live control: a flat KEY=VALUE mailbox (MS/MAXMS/PERF) the host
