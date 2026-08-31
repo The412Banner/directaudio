@@ -1,6 +1,6 @@
 # DirectAudio — Progress Log / Checkpoint
 
-## 2026-08-31 — feat/mic-capture: microphone capture (built, device test pending)
+## 2026-08-31 — v1.3.2: microphone capture (`BANNER_AUDIO_DIRECT_MIC`) — device-proven
 
 Completes the parked capture half. A WASAPI capture endpoint backed by an AAudio `INPUT` stream, gated behind a
 new **`BANNER_AUDIO_DIRECT_MIC`** knob (env-read once at process attach, boolean like `_WATCHDOG`; default off).
@@ -33,12 +33,15 @@ Config path (must match the app side): `getenv("BANNER_AUDIO_DIRECT_MIC")` in `r
 set in the container/shortcut env like every other `BANNER_AUDIO_DIRECT_*` env knob. NOT a live mailbox key —
 endpoint enumeration is a one-time startup event, so a mid-session toggle could not retroactively expose it.
 
-Open risks (device test): the input stream's effect on the render latency floor (README flags this as the item
-that could knock the output off the fast path — needs measuring, not assuming); AAudio input open under FEX is
-untested; and if `capture_open_stream` fails on a route change the reopen keeps the dead stream (no input
-watchdog yet, unlike the render side). TEST: hot-swap the 3-file set, `BANNER_AUDIO_DIRECT_MIC=1` +
-`BANNER_AUDIO_DIRECT_LOG=1` on a Source title, grant RECORD_AUDIO, and confirm `capture open/start` in logcat +
-voice reaching a VAC server.
+Device-proven (AYANEO Pocket FIT / Adreno 750, Android 14): a real 48 kHz mono-mic recording captured through the
+driver, and TF2's in-game Options → Voice "Test Microphone" meter tracking live mic input. Shipped in v1.3.2,
+opt-in via `BANNER_AUDIO_DIRECT_MIC=1`; default off stays byte-identical to v1.3.1.
+
+Still open (honest gaps): a real 2-player online voice round-trip (mic → VAC server → second player) is not yet
+validated; the input stream's effect on the render latency floor (the item that could knock the output off the
+fast path) still needs measuring on device, not assuming; AAudio input open under FEX beyond this device is
+unproven; and if `capture_open_stream` fails on a route change the reopen keeps the dead stream (no input
+watchdog yet, unlike the render side).
 
 ## 2026-08-14 — v1.3.1: live in-game config ("mailbox")
 
