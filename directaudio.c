@@ -57,6 +57,14 @@
 extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuilder *builder,
                                                                aaudio_usage_t usage);
 
+/* setInputPreset is API 28+. Same treatment as setUsage above: redeclared weak so
+ * the linker leaves its address NULL on API 26/27 libaaudio instead of failing the
+ * -z now .so load, and the capture-open path only calls it when present AND
+ * api_level >= 28. VOICE_COMMUNICATION is what enables the platform AEC / noise
+ * suppression / auto-gain that voice chat needs. */
+extern __attribute__((weak)) void AAudioStreamBuilder_setInputPreset(AAudioStreamBuilder *builder,
+                                                                     aaudio_input_preset_t inputPreset);
+
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
@@ -120,6 +128,14 @@ struct directaudio_stream
     int in_mixer;        /* registered with the shared output mixer */
     double rs_pos;       /* fractional resample read position (voice rate != 48k) */
     BOOL is_float;       /* source samples are 32-bit float (else PCM by wBitsPerSample) */
+
+    /* in-process capture voice state (see the capture subsystem). A stream is
+     * either a render voice (in_mixer) or a capture voice (in_capture), never
+     * both; the render ring fields (local_buffer / {lcl,wri}_offs / held /
+     * written_frames / getbuf_last / tmp_buffer) are reused for the capture ring
+     * with the producer/consumer roles inverted, exactly as winecoreaudio does. */
+    int in_capture;      /* registered with the shared input */
+    double cap_rs_pos;   /* fractional resample read position (client rate != 48k) */
 
     /* measurement */
     unsigned int cb_count;
@@ -401,6 +417,19 @@ static UINT64 da_punish_ns = DA_DECAY_PUNISH_NS;
 static unsigned int da_max_backoff = DA_DECAY_MAX_BACKOFF;
 static BOOL da_watchdog = TRUE;
 static int da_log = 0;
+
+/* Microphone capture master gate. OFF by default: with it unset the driver
+ * exposes ZERO capture endpoints and every capture op returns
+ * AUDCLNT_E_DEVICE_INVALIDATED - byte-identical to the render-only build, so no
+ * existing title changes behaviour. It exists because a capture endpoint that a
+ * game can enumerate but not open black-screens titles that probe the mic at
+ * startup (God of War, DiRT 3), so the capture path must be OFF unless a host that
+ * actually wants the mic opts in with BANNER_AUDIO_DIRECT_MIC=1. Read once at
+ * process attach because get_endpoint_ids (a process-wide query with no stream) is
+ * answered before any stream exists - a mid-session mailbox toggle could not
+ * retroactively expose an endpoint the game already enumerated, so this is an
+ * env-at-launch knob, not a live mailbox key. */
+static BOOL da_mic_enabled = FALSE;
 
 /* --- live runtime config ("mailbox") --------------------------------------
  * BANNER_AUDIO_DIRECT_RUNTIME names a flat KEY=VALUE file the host app rewrites
@@ -1147,6 +1176,421 @@ static int env_pos(const char *name, int fallback)
     return v > 0 ? v : fallback;
 }
 
+/* ---- microphone capture ---------------------------------------------------
+ * The mirror image of the render mixer, inverted. Exactly ONE AAudio stream in
+ * the INPUT direction (48 kHz / float / stereo, VOICE_COMMUNICATION preset for
+ * platform AEC + noise-suppression + auto-gain) whose data callback is the
+ * producer: it distributes each captured block to every registered capture voice,
+ * converting to that voice's client format / rate / channel count as it fills the
+ * voice's ring. get_capture_buffer / release_capture_buffer are the consumer, the
+ * same period-chunk protocol as the render side in reverse. Opened LAZILY on the
+ * first capture stream and STARTED only on the first Start (so the mic goes hot no
+ * earlier than the game asks to record, and enumeration alone never touches it),
+ * and the whole thing is dead code unless BANNER_AUDIO_DIRECT_MIC=1.
+ *
+ * Reusing the render ring fields keeps create_stream / the timer loop / the vtable
+ * shared: a capture stream's producer writes at wri_offs_frames and the consumer
+ * reads period-sized chunks at lcl_offs_frames, held_frames is the fill, and the
+ * per-period stream->event the timer loop already raises is exactly the "data
+ * ready" signal WASAPI capture wants. */
+
+struct directaudio_capture
+{
+    pthread_mutex_t lock;
+    AAudioStream *aq;                 /* the one AAudio INPUT stream */
+    struct directaudio_stream *voices[MIX_MAX_VOICES];
+    int nvoices;
+    aaudio_performance_mode_t perf;
+    int started;                      /* requestStart issued on the current stream */
+
+    /* Actual granted input geometry, read back after open. We ask for
+     * 48 kHz / float / stereo but honour whatever AAudio hands us (a mono mic, a
+     * device-native rate on an API level that will not resample input) by
+     * converting in the callback. Written only under lock (open / reopen); the
+     * callback reads them while holding lock, so they never change mid-block. */
+    int32_t in_rate, in_channels;
+    aaudio_format_t in_format;
+
+    /* single-flight reopen, identical contract to the mixer's */
+    int reopen_running, reopen_redo;
+
+    unsigned int cb_count;
+    UINT64 last_cb_ns;
+};
+static struct directaudio_capture g_capture = { PTHREAD_MUTEX_INITIALIZER };
+
+/* one float sample in [-1,1] -> the voice's client sample format at (frame, c) */
+static inline void samp_from_float(const struct directaudio_stream *v, BYTE *frame, int c, float val)
+{
+    if (val > 1.0f) val = 1.0f;
+    else if (val < -1.0f) val = -1.0f;
+
+    if (v->is_float)
+    {
+        ((float *)frame)[c] = val;
+        return;
+    }
+    switch (v->fmt->wBitsPerSample)
+    {
+    case 16: ((INT16 *)frame)[c] = (INT16)(val * 32767.0f + (val >= 0 ? 0.5f : -0.5f)); return;
+    case 32: ((INT32 *)frame)[c] = (INT32)(val * 2147483647.0);                          return;
+    case 8:  ((BYTE  *)frame)[c] = (BYTE)(val * 127.0f + 128.5f);                         return;
+    case 24:
+    {
+        INT32 s = (INT32)(val * 8388607.0f + (val >= 0 ? 0.5f : -0.5f));
+        BYTE *p = frame + c * 3;
+        p[0] = s & 0xff; p[1] = (s >> 8) & 0xff; p[2] = (s >> 16) & 0xff;
+        return;
+    }
+    }
+}
+
+/* one stereo-float source frame -> the voice's client frame. Channels above two
+ * are filled with silence (a mic has no surround content); mono folds L+R. Input
+ * gain is deliberately NOT scaled by the stream volumes - the VOICE_COMMUNICATION
+ * auto-gain owns the mic level, and applying a capture "volume" on top fights it. */
+static inline void capture_put_frame(struct directaudio_stream *v, BYTE *frame, float L, float R)
+{
+    int ch = v->fmt->nChannels, c;
+
+    if (ch == 1)
+    {
+        samp_from_float(v, frame, 0, (L + R) * 0.5f);
+        return;
+    }
+    samp_from_float(v, frame, 0, L);
+    samp_from_float(v, frame, 1, R);
+    for (c = 2; c < ch; c++) samp_from_float(v, frame, c, 0.0f);
+}
+
+/* read the i-th AAudio input frame as a stereo-float pair, honouring the actual
+ * granted format (float / I16) and channel count (mono duplicated to both). */
+static inline void capture_in_frame(const struct directaudio_capture *cap, const void *buf,
+                                    int32_t i, float *L, float *R)
+{
+    int ch = cap->in_channels;
+
+    if (cap->in_format == AAUDIO_FORMAT_PCM_I16)
+    {
+        const INT16 *p = (const INT16 *)buf + (size_t)i * ch;
+        float a = p[0] * (1.0f / 32768.0f);
+        *L = a;
+        *R = ch > 1 ? p[1] * (1.0f / 32768.0f) : a;
+    }
+    else /* AAUDIO_FORMAT_PCM_FLOAT (what we request; the common and default case) */
+    {
+        const float *p = (const float *)buf + (size_t)i * ch;
+        *L = p[0];
+        *R = ch > 1 ? p[1] : p[0];
+    }
+}
+
+/* Producer: convert one captured block into voice v's ring. Rate-converts from
+ * cap->in_rate to the voice's client rate with a carried fractional position
+ * (a straight copy when they match, which is the mix-format path Steam voice
+ * uses), folds channels, and writes the client sample format. On overrun (the
+ * guest is not draining) the oldest frame is dropped, the standard WASAPI capture
+ * behaviour. Called from the input callback with cap->lock held; takes v->lock. */
+static void capture_fill_voice(struct directaudio_capture *cap, struct directaudio_stream *v,
+                               const void *buf, int32_t frames)
+{
+    double ratio;
+    UINT32 bs, ba;
+
+    pthread_mutex_lock(&v->lock);
+
+    if (!v->playing || !v->local_buffer || !(bs = v->bufsize_frames))
+    {
+        pthread_mutex_unlock(&v->lock);
+        return;
+    }
+    ba = v->fmt->nBlockAlign;
+    ratio = (double)cap->in_rate / (v->aa_rate > 0 ? v->aa_rate : MIX_OUT_RATE);
+
+    while (v->cap_rs_pos < frames)
+    {
+        UINT32 i0 = (UINT32)v->cap_rs_pos;
+        double frac = v->cap_rs_pos - i0;
+        float L0, R0, L1, R1;
+        BYTE *dst = v->local_buffer + (size_t)v->wri_offs_frames * ba;
+
+        capture_in_frame(cap, buf, i0, &L0, &R0);
+        if (i0 + 1 < (UINT32)frames) capture_in_frame(cap, buf, i0 + 1, &L1, &R1);
+        else { L1 = L0; R1 = R0; }
+
+        capture_put_frame(v, dst, (float)(L0 + (L1 - L0) * frac), (float)(R0 + (R1 - R0) * frac));
+
+        v->wri_offs_frames = (v->wri_offs_frames + 1) % bs;
+        if (v->held_frames < bs) v->held_frames++;
+        else v->lcl_offs_frames = (v->lcl_offs_frames + 1) % bs;   /* overrun: drop oldest */
+
+        v->cap_rs_pos += ratio;
+    }
+    v->cap_rs_pos -= frames;   /* carry the fractional remainder into the next block */
+
+    pthread_mutex_unlock(&v->lock);
+}
+
+/* AAudio pushes captured input on its high-priority thread. */
+static aaudio_data_callback_result_t capture_cb(AAudioStream *aq, void *user,
+                                                void *audioData, int32_t numFrames)
+{
+    struct directaudio_capture *cap = user;
+    int i;
+
+    __atomic_store_n(&cap->last_cb_ns, da_now_ns(), __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&cap->cb_count, 1, __ATOMIC_SEQ_CST);
+
+    /* Ignore blocks from a stream that is no longer current: the OLD input while a
+     * reopen tears it down (it keeps running until requestStop). It must not write
+     * into a voice ring the new stream also feeds. Same guard the mixer uses. */
+    {
+        AAudioStream *cur = __atomic_load_n(&cap->aq, __ATOMIC_SEQ_CST);
+        if (cur && aq != cur) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+
+    pthread_mutex_lock(&cap->lock);
+    for (i = 0; i < cap->nvoices; i++)
+        capture_fill_voice(cap, cap->voices[i], audioData, numFrames);
+    pthread_mutex_unlock(&cap->lock);
+
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+static void capture_request_reopen(struct directaudio_capture *cap, const char *why);
+
+static void capture_error_cb(AAudioStream *aq, void *user, aaudio_result_t error)
+{
+    struct directaudio_capture *cap = user;
+
+    if (aq != __atomic_load_n(&cap->aq, __ATOMIC_SEQ_CST)) return;
+    if (error != AAUDIO_ERROR_DISCONNECTED &&
+        error != AAUDIO_ERROR_INVALID_STATE &&
+        error != AAUDIO_ERROR_INVALID_HANDLE &&
+        error != AAUDIO_ERROR_TIMEOUT)
+        return;
+    capture_request_reopen(cap, "capture stream error");
+}
+
+/* open (NOT start) the one AAudio input stream: 48 kHz / float / stereo. */
+static aaudio_result_t capture_open_stream(struct directaudio_capture *cap, AAudioStream **out)
+{
+    AAudioStreamBuilder *builder = NULL;
+    AAudioStream *aq = NULL;
+    aaudio_result_t r;
+
+    r = AAudio_createStreamBuilder(&builder);
+    if (r != AAUDIO_OK || !builder)
+        return r != AAUDIO_OK ? r : AAUDIO_ERROR_NO_MEMORY;
+
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setPerformanceMode(builder, cap->perf);
+    /* API 28+ only, via the weak ref: VOICE_COMMUNICATION turns on the platform
+     * echo-cancel / noise-suppress / auto-gain path that voice chat depends on. */
+    if (AAudioStreamBuilder_setInputPreset && android_get_device_api_level() >= 28)
+        AAudioStreamBuilder_setInputPreset(builder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setChannelCount(builder, MIX_OUT_CHANNELS);
+    AAudioStreamBuilder_setSampleRate(builder, MIX_OUT_RATE);
+    AAudioStreamBuilder_setDataCallback(builder, capture_cb, cap);
+    AAudioStreamBuilder_setErrorCallback(builder, capture_error_cb, cap);
+
+    r = AAudioStreamBuilder_openStream(builder, &aq);
+    AAudioStreamBuilder_delete(builder);
+    if (r != AAUDIO_OK || !aq)
+        return r != AAUDIO_OK ? r : AAUDIO_ERROR_INTERNAL;
+
+    DA_EVENT("capture open: req 48000/float/2ch preset=voicecomm perf=%d - got rate=%d ch=%d fmt=%d",
+             cap->perf, AAudioStream_getSampleRate(aq), AAudioStream_getChannelCount(aq),
+             AAudioStream_getFormat(aq));
+
+    __atomic_store_n(&cap->last_cb_ns, da_now_ns(), __ATOMIC_SEQ_CST);
+    *out = aq;
+    return AAUDIO_OK;
+}
+
+/* read back the granted geometry the callback converts from */
+static void capture_note_geometry(struct directaudio_capture *cap, AAudioStream *aq)
+{
+    cap->in_rate = AAudioStream_getSampleRate(aq);
+    cap->in_channels = AAudioStream_getChannelCount(aq);
+    cap->in_format = AAudioStream_getFormat(aq);
+    if (cap->in_rate <= 0) cap->in_rate = MIX_OUT_RATE;
+    if (cap->in_channels <= 0) cap->in_channels = MIX_OUT_CHANNELS;
+}
+
+static void *capture_reopen_thread(void *user)
+{
+    struct directaudio_capture *cap = user;
+
+    for (;;)
+    {
+        AAudioStream *old = NULL, *neu = NULL;
+        int expected = 0, want_start;
+
+        __atomic_store_n(&cap->reopen_redo, 0, __ATOMIC_SEQ_CST);
+
+        pthread_mutex_lock(&cap->lock);
+        want_start = cap->started;   /* if the mic was live, bring the new one up too */
+        pthread_mutex_unlock(&cap->lock);
+
+        if (capture_open_stream(cap, &neu) == AAUDIO_OK)
+        {
+            pthread_mutex_lock(&cap->lock);
+            old = cap->aq;
+            capture_note_geometry(cap, neu);
+            __atomic_store_n(&cap->aq, neu, __ATOMIC_SEQ_CST);
+            cap->started = 0;
+            pthread_mutex_unlock(&cap->lock);
+
+            if (want_start)
+            {
+                if (AAudioStream_requestStart(neu) == AAUDIO_OK)
+                {
+                    pthread_mutex_lock(&cap->lock);
+                    cap->started = 1;
+                    pthread_mutex_unlock(&cap->lock);
+                }
+                else WARN("capture reopen: requestStart failed\n");
+            }
+        }
+        else WARN("capture reopen failed; keeping old stream\n");
+
+        /* close() blocks until the old stream's in-flight callback returns; do it
+         * outside the lock so that callback (which takes cap->lock) can drain. */
+        if (old)
+        {
+            AAudioStream_requestStop(old);
+            AAudioStream_close(old);
+            TRACE("reopened capture input\n");
+        }
+
+        if (__atomic_load_n(&cap->reopen_redo, __ATOMIC_SEQ_CST))
+        {
+            usleep(20000);
+            continue;
+        }
+        __atomic_store_n(&cap->reopen_running, 0, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&cap->reopen_redo, __ATOMIC_SEQ_CST))
+            break;
+        if (!__atomic_compare_exchange_n(&cap->reopen_running, &expected, 1, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            break;
+    }
+    return NULL;
+}
+
+static void capture_request_reopen(struct directaudio_capture *cap, const char *why)
+{
+    int expected = 0;
+
+    __atomic_store_n(&cap->reopen_redo, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_compare_exchange_n(&cap->reopen_running, &expected, 1, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    {
+        pthread_t th;
+        WARN("%s - reopening capture input\n", why);
+        DA_EVENT("capture reopen: %s", why);
+        if (pthread_create(&th, NULL, capture_reopen_thread, cap))
+            __atomic_store_n(&cap->reopen_running, 0, __ATOMIC_SEQ_CST);
+        else
+            pthread_detach(th);
+    }
+}
+
+/* open the shared input on the first capture voice (lazy: enumeration never gets
+ * here). Returns the AAudio result so create_stream can fail gracefully - a mic
+ * that will not open (RECORD_AUDIO not granted to the app) yields
+ * AUDCLNT_E_DEVICE_INVALIDATED rather than a half-registered voice. */
+static aaudio_result_t capture_add_voice(struct directaudio_capture *cap, struct directaudio_stream *v)
+{
+    aaudio_result_t r = AAUDIO_OK;
+
+    pthread_mutex_lock(&cap->lock);
+    if (!cap->aq)
+    {
+        cap->perf = v->aa_perf;
+        r = capture_open_stream(cap, &cap->aq);
+        if (r == AAUDIO_OK) capture_note_geometry(cap, cap->aq);
+    }
+    if (r == AAUDIO_OK)
+    {
+        if (cap->nvoices < MIX_MAX_VOICES)
+        {
+            v->cap_rs_pos = 0.0;
+            v->in_capture = 1;
+            cap->voices[cap->nvoices++] = v;
+        }
+        else r = AAUDIO_ERROR_NO_MEMORY;
+    }
+    pthread_mutex_unlock(&cap->lock);
+    return r;
+}
+
+static void capture_remove_voice(struct directaudio_capture *cap, struct directaudio_stream *v)
+{
+    AAudioStream *stop = NULL;
+    int i;
+
+    pthread_mutex_lock(&cap->lock);
+    for (i = 0; i < cap->nvoices; i++)
+    {
+        if (cap->voices[i] == v)
+        {
+            cap->voices[i] = cap->voices[--cap->nvoices];
+            break;
+        }
+    }
+    v->in_capture = 0;
+    /* Last voice gone: stop the mic so the OS recording indicator clears and we
+     * stop holding an input route open. Keep the stream OPEN (not closed) so the
+     * next capture client reuses it; requestStart is valid again from STOPPED.
+     * requestStop must run OUTSIDE the lock - it can wait on the callback, which
+     * takes the lock - so mark the intent here and act after unlock. */
+    if (cap->nvoices == 0 && cap->aq && cap->started)
+    {
+        stop = cap->aq;
+        cap->started = 0;
+    }
+    pthread_mutex_unlock(&cap->lock);
+
+    if (stop)
+    {
+        AAudioStream_requestStop(stop);
+        DA_EVENT("capture stop: no voices");
+    }
+}
+
+/* start the mic on the first Start. Called WITHOUT stream->lock held (see
+ * unix_start) so the cap->lock acquisition here can never invert against the
+ * callback's cap->lock -> v->lock order. */
+static void capture_ensure_started(struct directaudio_capture *cap)
+{
+    AAudioStream *aq = NULL;
+
+    pthread_mutex_lock(&cap->lock);
+    if (cap->aq && !cap->started)
+    {
+        cap->started = 1;
+        aq = cap->aq;
+    }
+    pthread_mutex_unlock(&cap->lock);
+
+    if (aq)
+    {
+        aaudio_result_t r = AAudioStream_requestStart(aq);
+        if (r != AAUDIO_OK)
+        {
+            WARN("capture requestStart failed: %d\n", r);
+            pthread_mutex_lock(&cap->lock);
+            cap->started = 0;
+            pthread_mutex_unlock(&cap->lock);
+        }
+        else DA_EVENT("capture start");
+    }
+}
+
 /* Process-wide tuning, read once at DLL attach rather than per stream: the guest
  * asks for the device period before it creates anything, and the watchdog/decay
  * timings belong to the single shared mixer. Every value here is a number chosen
@@ -1168,6 +1612,13 @@ static void read_global_config_from_env(void)
          * treated as "unset" - hence the explicit read instead of env_pos. */
         const char *e = getenv("BANNER_AUDIO_DIRECT_WATCHDOG");
         if (e && *e) da_watchdog = atoi(e) != 0;
+    }
+    {
+        /* Microphone capture gate. Boolean like _WATCHDOG (a literal 0 is
+         * meaningful), so read it explicitly rather than via env_pos. Default off:
+         * unset => zero capture endpoints, all capture ops DEVICE_INVALIDATED. */
+        const char *e = getenv("BANNER_AUDIO_DIRECT_MIC");
+        if (e && *e) da_mic_enabled = atoi(e) != 0;
     }
     {
         /* The live-config mailbox: a file the host app rewrites in-game. Read it
@@ -1267,14 +1718,17 @@ static NTSTATUS unix_get_endpoint_ids(void *args)
     struct endpoint *endpoint = params->endpoints;
 
     params->default_idx = 0;
-    /* Expose a render endpoint only. Capture (mic) is a later phase: create_stream
-     * returns DEVICE_INVALIDATED for eCapture, so advertising a capture endpoint the
-     * game can enumerate but never open makes it abandon audio init entirely and boot
-     * to a black screen. A fresh same-setup winealsa capture that BOOTS exposes zero
-     * capture endpoints and DiRT 3 initialises render fine, confirming no mic device is
-     * needed. (The earlier assumption that a missing capture endpoint caused the hang
+    /* Always one render endpoint. A capture endpoint ONLY when BANNER_AUDIO_DIRECT_MIC
+     * is on: advertising a capture endpoint the game can enumerate but never open makes
+     * it abandon audio init entirely and boot to a black screen (device-proven with God
+     * of War and DiRT 3), which is why the render-only default exposes zero capture
+     * endpoints. With the mic gate on, the capture endpoint is real - create_stream
+     * opens an AAudio input behind it - so enumerate-then-probe succeeds instead of
+     * dead-ending. (The earlier assumption that a missing capture endpoint caused a hang
      * was wrong - that hang was the PhysicalSpeakers E_NOTIMPL gate, fixed separately.) */
-    params->num = (params->flow == eRender) ? 1 : 0;
+    if (params->flow == eRender)       params->num = 1;
+    else if (params->flow == eCapture) params->num = da_mic_enabled ? 1 : 0;
+    else                               params->num = 0;
 
     TRACE("get_endpoint_ids: flow=%d -> num=%u\n", params->flow, params->num);
 
@@ -1342,9 +1796,18 @@ static NTSTATUS unix_create_stream(void *args)
     stream->flags = params->flags;
     stream->share = params->share;
 
-    if (stream->flow != eRender)
+    /* Render always; capture only behind the mic gate. Anything else (a stray
+     * loopback etc.) is refused. With the gate off this is the exact old behaviour:
+     * every eCapture create returns DEVICE_INVALIDATED before any AAudio input is
+     * touched. The format validation + ring allocation below are shared by both
+     * flows; the flow-specific voice registration happens after it. */
+    if (stream->flow != eRender && stream->flow != eCapture)
     {
-        /* capture is a later phase */
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        goto end;
+    }
+    if (stream->flow == eCapture && !da_mic_enabled)
+    {
         params->result = AUDCLNT_E_DEVICE_INVALIDATED;
         goto end;
     }
@@ -1383,14 +1846,31 @@ static NTSTATUS unix_create_stream(void *args)
     }
     silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
 
-    /* Register as a mixer voice; the shared output opens on the first voice.
-     * stream->playing gates real audio vs. silence in the mix. */
-    r = mixer_add_voice(&g_mixer, stream);
-    if (r != AAUDIO_OK)
+    if (stream->flow == eCapture)
     {
-        WARN("mixer add voice failed: %d\n", r);
-        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
-        goto end;
+        /* Register as a capture voice; the shared AAudio input opens (not starts)
+         * on the first voice, and the first Start makes the mic hot. A mic that
+         * will not open (RECORD_AUDIO not granted) fails gracefully here. */
+        r = capture_add_voice(&g_capture, stream);
+        if (r != AAUDIO_OK)
+        {
+            WARN("capture add voice failed: %d (RECORD_AUDIO not granted?)\n", r);
+            DA_EVENT("capture open failed: %d - mic unavailable, invalidating endpoint", r);
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+            goto end;
+        }
+    }
+    else
+    {
+        /* Register as a mixer voice; the shared output opens on the first voice.
+         * stream->playing gates real audio vs. silence in the mix. */
+        r = mixer_add_voice(&g_mixer, stream);
+        if (r != AAUDIO_OK)
+        {
+            WARN("mixer add voice failed: %d\n", r);
+            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+            goto end;
+        }
     }
     params->result = S_OK;
 
@@ -1399,6 +1879,8 @@ end:
     {
         if (stream->in_mixer)
             mixer_remove_voice(&g_mixer, stream);
+        if (stream->in_capture)
+            capture_remove_voice(&g_capture, stream);
         if (stream->local_buffer)
         {
             size = 0;
@@ -1446,6 +1928,10 @@ static NTSTATUS unix_release_stream(void *args)
 
     if (stream->in_mixer)
         mixer_remove_voice(&g_mixer, stream);
+    /* Syncs with the input callback via cap->lock, so once it returns no callback
+     * references this voice and the ring below can be freed safely. */
+    if (stream->in_capture)
+        capture_remove_voice(&g_capture, stream);
 
     if (stream->local_buffer)
     {
@@ -1641,6 +2127,7 @@ static NTSTATUS unix_start(void *args)
 {
     struct start_params *params = args;
     struct directaudio_stream *stream = handle_get_stream(params->stream);
+    BOOL start_capture = FALSE;
 
     pthread_mutex_lock(&stream->lock);
 
@@ -1652,9 +2139,18 @@ static NTSTATUS unix_start(void *args)
     {
         stream->playing = TRUE;
         params->result = S_OK;
+        if (stream->flow == eCapture) start_capture = TRUE;
     }
 
     pthread_mutex_unlock(&stream->lock);
+
+    /* Deferred to here, AFTER releasing stream->lock, so the cap->lock taken by
+     * capture_ensure_started never nests inside stream->lock and can never invert
+     * against the callback's cap->lock -> v(stream)->lock order. This is also what
+     * keeps the mic cold until the game actually starts recording. */
+    if (start_capture)
+        capture_ensure_started(&g_capture);
+
     return STATUS_SUCCESS;
 }
 
@@ -1901,26 +2397,148 @@ static NTSTATUS unix_release_render_buffer(void *args)
     return STATUS_SUCCESS;
 }
 
+/* IAudioCaptureClient::GetBuffer. Serves the captured ring the input callback
+ * fills, one device-period chunk at a time (the WASAPI capture contract), using
+ * tmp_buffer to linearise a chunk that wraps the ring - the mirror of the render
+ * get_buffer. Returns AUDCLNT_S_BUFFER_EMPTY (a SUCCESS status, not an error) when
+ * a full period is not yet held, which is how a polling capture client is told to
+ * wait. Only ever reached for a capture stream (mmdevapi calls it on the capture
+ * client); a non-capture stream gets the render-only DEVICE_INVALIDATED, so the
+ * mic-off build is byte-identical here. */
 static NTSTATUS unix_get_capture_buffer(void *args)
 {
     struct get_capture_buffer_params *params = args;
+    struct directaudio_stream *stream = handle_get_stream(params->stream);
+    UINT32 chunk_frames, chunk_bytes;
+    LARGE_INTEGER stamp, freq;
+    SIZE_T size;
+
+    if (stream->flow != eCapture)
+    {
+        *params->frames = 0;
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
+
+    pthread_mutex_lock(&stream->lock);
+
+    if (stream->getbuf_last)
+    {
+        params->result = AUDCLNT_E_OUT_OF_ORDER;
+        goto end;
+    }
+
     *params->frames = 0;
-    params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+
+    if (stream->held_frames < stream->period_frames)
+    {
+        params->result = AUDCLNT_S_BUFFER_EMPTY;
+        goto end;
+    }
+
+    *params->flags = 0;
+    chunk_frames = stream->bufsize_frames - stream->lcl_offs_frames;
+    if (chunk_frames < stream->period_frames)
+    {
+        /* the period wraps the ring end - linearise it into tmp_buffer. Allocated
+         * with zero_bits so its address is 32-bit-addressable for the wow64 guest,
+         * exactly like the render path's tmp/local buffers. */
+        chunk_bytes = chunk_frames * stream->fmt->nBlockAlign;
+        if (!stream->tmp_buffer)
+        {
+            size = stream->period_frames * stream->fmt->nBlockAlign;
+            if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer, zero_bits,
+                                        &size, MEM_COMMIT, PAGE_READWRITE))
+            {
+                params->result = E_OUTOFMEMORY;
+                goto end;
+            }
+            stream->tmp_buffer_frames = stream->period_frames;
+        }
+        *params->data = stream->tmp_buffer;
+        memcpy(stream->tmp_buffer,
+               stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign, chunk_bytes);
+        memcpy(stream->tmp_buffer + chunk_bytes, stream->local_buffer,
+               stream->period_frames * stream->fmt->nBlockAlign - chunk_bytes);
+    }
+    else
+        *params->data = stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign;
+
+    stream->getbuf_last = *params->frames = stream->period_frames;
+
+    if (params->devpos)
+        *params->devpos = stream->written_frames;
+    if (params->qpcpos)
+    {
+        NtQueryPerformanceCounter(&stamp, &freq);
+        *params->qpcpos = (stamp.QuadPart * (INT64)10000000) / freq.QuadPart;
+    }
+    params->result = S_OK;
+
+end:
+    pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
 
+/* IAudioCaptureClient::ReleaseBuffer - advance the read side by the frames the
+ * guest consumed (all-or-nothing per the WASAPI contract), the mirror of the
+ * render release. */
 static NTSTATUS unix_release_capture_buffer(void *args)
 {
     struct release_capture_buffer_params *params = args;
-    params->result = params->done ? AUDCLNT_E_OUT_OF_ORDER : S_OK;
+    struct directaudio_stream *stream = handle_get_stream(params->stream);
+
+    if (stream->flow != eCapture)
+    {
+        params->result = params->done ? AUDCLNT_E_OUT_OF_ORDER : S_OK;
+        return STATUS_SUCCESS;
+    }
+
+    pthread_mutex_lock(&stream->lock);
+
+    if (!params->done)
+    {
+        stream->getbuf_last = 0;
+        params->result = S_OK;
+    }
+    else if (!stream->getbuf_last)
+        params->result = AUDCLNT_E_OUT_OF_ORDER;
+    else if (stream->getbuf_last != (INT32)params->done)
+        params->result = AUDCLNT_E_INVALID_SIZE;
+    else
+    {
+        stream->written_frames += params->done;
+        stream->held_frames -= params->done;
+        stream->lcl_offs_frames += params->done;
+        stream->lcl_offs_frames %= stream->bufsize_frames;
+        stream->getbuf_last = 0;
+        params->result = S_OK;
+    }
+
+    pthread_mutex_unlock(&stream->lock);
     return STATUS_SUCCESS;
 }
 
+/* IAudioCaptureClient::GetNextPacketSize - a full period once one is held, else 0
+ * so a polling client keeps waiting. Capture-only; a render stream keeps the
+ * render-only DEVICE_INVALIDATED. */
 static NTSTATUS unix_get_next_packet_size(void *args)
 {
     struct get_next_packet_size_params *params = args;
-    *params->frames = 0;
-    params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+    struct directaudio_stream *stream = handle_get_stream(params->stream);
+
+    if (stream->flow != eCapture)
+    {
+        *params->frames = 0;
+        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+        return STATUS_SUCCESS;
+    }
+
+    pthread_mutex_lock(&stream->lock);
+    *params->frames = (stream->held_frames >= stream->period_frames) ? stream->period_frames : 0;
+    pthread_mutex_unlock(&stream->lock);
+
+    params->result = S_OK;
     return STATUS_SUCCESS;
 }
 
@@ -2059,7 +2677,7 @@ static NTSTATUS unix_set_event_handle(void *args)
     HRESULT hr = S_OK;
 
     pthread_mutex_lock(&stream->lock);
-    if (!stream->in_mixer)
+    if (!stream->in_mixer && !stream->in_capture)
         hr = AUDCLNT_E_DEVICE_INVALIDATED;
     else if (!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
         hr = AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;
@@ -2262,15 +2880,21 @@ static NTSTATUS unix_wow64_get_capture_buffer(void *args)
         PTR32 devpos;
         PTR32 qpcpos;
     } *params32 = args;
-    UINT32 frames = 0;
+    BYTE *data = NULL;
     struct get_capture_buffer_params params =
     {
         .stream = params32->stream,
-        .frames = &frames
+        .data   = &data,
+        .frames = ULongToPtr(params32->frames),
+        .flags  = ULongToPtr(params32->flags),
+        .devpos = ULongToPtr(params32->devpos),
+        .qpcpos = ULongToPtr(params32->qpcpos),
     };
     unix_get_capture_buffer(&params);
     params32->result = params.result;
-    *(unsigned int *)ULongToPtr(params32->frames) = frames;
+    /* The captured block (local_buffer / tmp_buffer) is allocated with zero_bits,
+     * so its address fits 32 bits for the guest - same writeback as render. */
+    *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
     return STATUS_SUCCESS;
 }
 
