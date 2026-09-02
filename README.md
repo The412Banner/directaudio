@@ -19,7 +19,7 @@ DirectAudio game → winedirectaudio.drv → in-process mixer ──────
 
 ## Status
 
-Device-proven, shipping. Current release **v1.3.1**, now built for **both Wine 10 and Wine 11** (see [Compatibility](#compatibility) and [Proton layers with DirectAudio built in](#proton-layers-with-directaudio-built-in)). Output: 48 kHz · float · stereo.
+Device-proven, shipping. Current release **v1.3.2** (adds opt-in [microphone capture](#compatibility)), built for **both Wine 10 and Wine 11** (see [Compatibility](#compatibility) and [Proton layers with DirectAudio built in](#proton-layers-with-directaudio-built-in)). Output: 48 kHz · float · stereo.
 
 ---
 
@@ -108,7 +108,7 @@ This is event-level only — a handful of lines per session. Per-callback heartb
 
 **Supports Wine 10 and Wine 11** — as two separate, per-Wine-major builds. The `mmdevapi` unixlib vtable is index-based, and Wine 11 inserted `midi_get_driver` at slot 30, shifting every later slot; Wine 10's `mmdevapi` has no MIDI dispatch at all. So **a single binary cannot span Proton 10 and 11** — each Wine major gets its own driver (`wine11` / `wine10`), and one `directaudio.c` compiles for both via a `WINE_MMDEVAPI_NO_MIDI_GET_DRIVER` gate (defined only on the Wine-10 base). The Wine-10 port keeps the full PE-side `mmdevdrv.c` architecture that Wine 10 requires.
 
-*Within* Wine 11, every point release is ABI-compatible: **one Wine-11 build serves all of Proton 11.0-1 / 11.0-3 / 11.0-5** — device-verified by hot-swapping a single driver across them (including the 32-bit PE, in a 32-bit game). Only the Wine 10 ↔ 11 boundary needs a separate build.
+*Within* Wine 11, every point release is ABI-compatible: **one Wine-11 build serves every 11.0-x layer** (Proton 11.0-1 / 11.0-2, GE-Proton 11.0-3 / 11.0-5 / 11.0-6) — device-verified by hot-swapping a single driver across them (including the 32-bit PE, in a 32-bit game). The same holds within Wine 10 (Proton 10.0-4, GE-Proton 10.0-34). Only the Wine 10 ↔ 11 boundary needs a separate build.
 
 **A complete driver is three files**, and which one loads depends on the **guest game's bitness**, not the Proton build: a 64-bit game loads `lib/wine/aarch64-windows/winedirectaudio.drv`, a 32-bit (wow64) game loads `lib/wine/i386-windows/winedirectaudio.drv`, and both share `lib/wine/aarch64-unix/winedirectaudio.so` (the unixlib — all the AAudio logic lives here). **Ship all three:** omitting the i386 PE silently leaves 32-bit games on whatever driver the layer already carried. (arm64ec vs x86_64 is a compile target, not an ABI split.)
 
@@ -122,16 +122,24 @@ This is event-level only — a handful of lines per session. Per-callback heartb
 
 ### Proton layers with DirectAudio built in
 
-Four bionic/arm64ec Proton builds ship DirectAudio v1.3.1 (opt-in via the `HKCU\Software\Wine\Drivers` `Audio=directaudio` registry value). **One Wine-11 driver covers the three 11.0-x layers**; **Proton 10.0-4** uses the Wine-10 build.
+**Seven** bionic/arm64ec Proton layers ship DirectAudio (opt-in via the `HKCU\Software\Wine\Drivers` `Audio=directaudio` registry value). **One Wine-11 driver covers all five 11.0-x layers**; the two Wine-10 layers use the Wine-10 build.
 
-| layer | Wine | release |
+| layer | Wine | driver |
 |---|---|---|
-| **Proton 11.0-1** | 11 | <https://github.com/The412Banner/proton-wine/releases/tag/build-p11-20260815> |
-| **GE-Proton 11.0-3** | 11 | <https://github.com/The412Banner/proton-wine/releases/tag/build-ge11.3-20260816-da131> |
-| **GE-Proton 11.0-5** | 11 | <https://github.com/The412Banner/proton-wine/releases/tag/build-ge11.5-20260811> |
-| **Proton 10.0-4** | 10 | <https://github.com/The412Banner/proton-wine/releases/tag/build-p10-20260815> |
+| **GE-Proton 11.0-6** | 11 | `wine11` |
+| **GE-Proton 11.0-5** | 11 | `wine11` |
+| **GE-Proton 11.0-3** | 11 | `wine11` |
+| **Proton 11.0-2** | 11 | `wine11` |
+| **Proton 11.0-1** | 11 | `wine11` |
+| **GE-Proton 10.0-34** | 10 | `wine10` |
+| **Proton 10.0-4** | 10 | `wine10` |
 
-Standalone **complete-driver zips** (both ABIs × both page sizes, each the full 3-file set) are attached to the [`directaudio-v1.3.1`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-v1.3.1) release for manual / hot-swap use.
+All seven are published together as one consolidated proton-wine release:
+
+- **Current stable — DirectAudio v1.3.1:** [`build-bionic-layers-20260830-fontcap`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260830-fontcap)
+- **Pre-release, DirectAudio v1.3.2** (unified true-SDK28 + 16 KB-aligned rebuild — CI-green and binary-verified, **not** device-boot-proven): [`build-bionic-layers-20260901-sdk28-16kb-da132`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260901-sdk28-16kb-da132)
+
+Standalone **complete-driver zips** (both ABIs × both page sizes, each the full 3-file set) are attached to the [`directaudio-v1.3.2`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-v1.3.2) release for manual / hot-swap use — that is the fastest way to put v1.3.2 on a layer that still carries v1.3.1.
 
 ### Configuration
 
@@ -317,14 +325,14 @@ Then apply the two small integration deltas that live **outside** this directory
 ### Pulling a new version into a consumer
 ```sh
 git -C dlls/winedirectaudio.drv fetch --tags
-git -C dlls/winedirectaudio.drv checkout directaudio-v1.3.1   # pin to a tagged, ABI-matched release
-git add dlls/winedirectaudio.drv && git commit -m "bump directaudio → v1.3.1"
+git -C dlls/winedirectaudio.drv checkout directaudio-v1.3.2   # pin to a tagged, ABI-matched release
+git add dlls/winedirectaudio.drv && git commit -m "bump directaudio → v1.3.2"
 ```
 The consumer always builds from a **pinned** driver commit — reproducible, never a moving target.
 
 ## ABI pinning — the one hard constraint
 
-Each release is **ABI-matched to a Wine base** (the `mmdevapi` unixlib vtable must match the `mmdevapi.dll` it ships with), and now carries a **variant per supported Wine major**: `directaudio-v1.3.1` attaches complete `wine11` **and** `wine10` driver sets (each the 3-file `aarch64` + `i386` PE + unixlib `.so`, for both 4 KB / 16 KB page sizes). CI builds each variant against its own pinned proton-wine ref — `ge-proton11-5-bionic-staging` for Wine 11, `proton_10.0` for Wine 10. New *driver logic* builds fine against a pinned base; a new *Wine major* is a new variant, not a new driver version.
+Each release is **ABI-matched to a Wine base** (the `mmdevapi` unixlib vtable must match the `mmdevapi.dll` it ships with), and now carries a **variant per supported Wine major**: `directaudio-v1.3.2` attaches complete `wine11` **and** `wine10` driver sets (each the 3-file `aarch64` + `i386` PE + unixlib `.so`, for both 4 KB / 16 KB page sizes). CI builds each variant against its own pinned proton-wine ref — `ge-proton11-5-bionic-staging` for Wine 11, `proton_10.0` for Wine 10. New *driver logic* builds fine against a pinned base; a new *Wine major* is a new variant, not a new driver version.
 
 ## Contributing
 

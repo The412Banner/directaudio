@@ -1,5 +1,19 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-09-02 — docs: README refreshed to v1.3.2 + the seven supported layers
+
+README was still 1.3.1-era in three places. Status now reads **v1.3.2** (opt-in mic capture). The
+"Proton layers with DirectAudio built in" table listed **four** layers off four separate per-layer
+release tags; it now lists all **seven** — GE-Proton 11.0-6 / 11.0-5 / 11.0-3, Proton 11.0-2 / 11.0-1
+(all `wine11`), GE-Proton 10.0-34 and Proton 10.0-4 (`wine10`) — pointing at the single consolidated
+proton-wine release instead, with the DA version each cut carries stated explicitly: stable
+`build-bionic-layers-20260830-fontcap` = **v1.3.1**, pre-release `build-bionic-layers-20260901-sdk28-16kb-da132`
+= **v1.3.2** (CI-green + binary-verified, NOT device-boot-proven). Hot-swap zip pointer and the
+submodule-pin example bumped to `directaudio-v1.3.2`. The ABI paragraph now names 11.0-2 and 10.0-34
+in the "one build per Wine major" claim.
+
+No driver code touched.
+
 ## 2026-08-31 — v1.3.2: microphone capture (`BANNER_AUDIO_DIRECT_MIC`) — device-proven
 
 Completes the parked capture half. A WASAPI capture endpoint backed by an AAudio `INPUT` stream, gated behind a
