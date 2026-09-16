@@ -80,6 +80,16 @@ extern __attribute__((weak)) void AAudioStreamBuilder_setInputPreset(AAudioStrea
 
 #include "../mmdevapi/unixlib.h"
 
+/* WINE_MMDEVAPI_SYSTEM_THREADS: newer mmdevapi (upstream Wine "Use a system
+ * thread for the audio driver main loop / timer loop thread", carried by e.g.
+ * Proton-CachyOS 11.0) loads the driver unixlib directly and no longer runs the
+ * main_loop / timer_loop calls on PE threads. The unix call table has
+ * main_loop_start + main_loop_stop instead of main_loop, no timer_loop slot, and
+ * release_stream no longer passes the timer thread. The driver owns the timer
+ * thread instead: unix_start spawns it with create_unix_thread (named
+ * "audio_client_timer" as mmdevapi did) and unix_release_stream joins it. The
+ * proton-wine tree that carries that mmdevapi defines this in configure.ac. */
+
 WINE_DEFAULT_DEBUG_CHANNEL(directaudio);
 
 struct directaudio_stream
@@ -91,6 +101,9 @@ struct directaudio_stream
     DWORD flags;
     AUDCLNT_SHAREMODE share;
     HANDLE event;
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+    HANDLE timer_thread;          /* owned by the driver (created in unix_start) */
+#endif
 
     BOOL playing, please_quit;
     REFERENCE_TIME period;
@@ -1678,12 +1691,14 @@ static NTSTATUS unix_process_attach(void *args)
     return STATUS_SUCCESS;
 }
 
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
 static NTSTATUS unix_main_loop(void *args)
 {
     struct main_loop_params *params = args;
     NtSetEvent(params->event, NULL);
     return STATUS_SUCCESS;
 }
+#endif
 
 static NTSTATUS unix_test_connect(void *args)
 {
@@ -1904,9 +1919,14 @@ static NTSTATUS unix_release_stream(void *args)
 {
     struct release_stream_params *params = args;
     struct directaudio_stream *stream = handle_get_stream(params->stream);
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+    HANDLE timer_thread = stream->timer_thread;
+#else
+    HANDLE timer_thread = params->timer_thread;
+#endif
     SIZE_T size;
 
-    if (params->timer_thread)
+    if (timer_thread)
     {
         LARGE_INTEGER timeout;
         __atomic_store_n(&stream->please_quit, TRUE, __ATOMIC_SEQ_CST);
@@ -1916,14 +1936,14 @@ static NTSTATUS unix_release_stream(void *args)
          * timer thread does not exit promptly, unblock the caller and leak the
          * stream rather than free memory the still-running timer touches (UAF). */
         timeout.QuadPart = -5000000; /* 500 ms */
-        if (NtWaitForSingleObject(params->timer_thread, FALSE, &timeout) != STATUS_SUCCESS)
+        if (NtWaitForSingleObject(timer_thread, FALSE, &timeout) != STATUS_SUCCESS)
         {
             WARN("release_stream: timer thread stuck; leaking stream to avoid hang\n");
-            NtClose(params->timer_thread);
+            NtClose(timer_thread);
             params->result = S_OK;
             return STATUS_SUCCESS;
         }
-        NtClose(params->timer_thread);
+        NtClose(timer_thread);
     }
 
     if (stream->in_mixer)
@@ -2123,6 +2143,10 @@ static NTSTATUS unix_get_current_padding(void *args)
     return STATUS_SUCCESS;
 }
 
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+static void unix_timer_loop(void *args);
+#endif
+
 static NTSTATUS unix_start(void *args)
 {
     struct start_params *params = args;
@@ -2143,6 +2167,27 @@ static NTSTATUS unix_start(void *args)
     }
 
     pthread_mutex_unlock(&stream->lock);
+
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+    /* What the older mmdevapi did in IAudioClient::Start: spawn the timer thread
+     * once, on the first successful start, and fail the start if it can't. */
+    if (params->result == S_OK && !stream->timer_thread)
+    {
+        static const WCHAR name[] =
+            {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
+
+        if (create_unix_thread(&stream->timer_thread, name, unix_timer_loop, stream))
+        {
+            ERR("failed to create the timer thread\n");
+            stream->timer_thread = NULL;
+            pthread_mutex_lock(&stream->lock);
+            stream->playing = FALSE;
+            pthread_mutex_unlock(&stream->lock);
+            params->result = E_FAIL;
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
 
     /* Deferred to here, AFTER releasing stream->lock, so the cap->lock taken by
      * capture_ensure_started never nests inside stream->lock and can never invert
@@ -2240,10 +2285,16 @@ static void mixer_watchdog(struct directaudio_mixer *mx)
     mixer_request_reopen(mx, "data callback stalled");
 }
 
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+static void unix_timer_loop(void *args)
+{
+    struct directaudio_stream *stream = args;
+#else
 static NTSTATUS unix_timer_loop(void *args)
 {
     struct timer_loop_params *params = args;
     struct directaudio_stream *stream = handle_get_stream(params->stream);
+#endif
     LARGE_INTEGER delay, next, last;
     int adjust;
 
@@ -2270,7 +2321,9 @@ static NTSTATUS unix_timer_loop(void *args)
         next.QuadPart += stream->period;
     }
 
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
     return STATUS_SUCCESS;
+#endif
 }
 
 static NTSTATUS unix_get_render_buffer(void *args)
@@ -2695,14 +2748,21 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     unix_process_attach,
     unix_not_implemented,        /* process_detach */
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+    unix_not_implemented,        /* main_loop_start: the driver needs no main loop */
+    unix_not_implemented,        /* main_loop_stop */
+#else
     unix_main_loop,
+#endif
     unix_get_endpoint_ids,
     unix_create_stream,
     unix_release_stream,
     unix_start,
     unix_stop,
     unix_reset,
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
     unix_timer_loop,
+#endif
     unix_get_render_buffer,
     unix_release_render_buffer,
     unix_get_capture_buffer,
@@ -2740,6 +2800,7 @@ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
 
 typedef UINT PTR32;
 
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
 static NTSTATUS unix_wow64_main_loop(void *args)
 {
     struct
@@ -2752,6 +2813,7 @@ static NTSTATUS unix_wow64_main_loop(void *args)
     };
     return unix_main_loop(&params);
 }
+#endif
 
 static NTSTATUS unix_wow64_test_connect(void *args)
 {
@@ -2833,13 +2895,17 @@ static NTSTATUS unix_wow64_release_stream(void *args)
     struct
     {
         stream_handle stream;
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
         PTR32 timer_thread;
+#endif
         HRESULT result;
     } *params32 = args;
     struct release_stream_params params =
     {
         .stream = params32->stream,
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
         .timer_thread = ULongToHandle(params32->timer_thread)
+#endif
     };
     unix_release_stream(&params);
     params32->result = params.result;
@@ -3193,14 +3259,21 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     unix_process_attach,
     unix_not_implemented,        /* process_detach */
+#ifdef WINE_MMDEVAPI_SYSTEM_THREADS
+    unix_not_implemented,        /* main_loop_start: the driver needs no main loop */
+    unix_not_implemented,        /* main_loop_stop */
+#else
     unix_wow64_main_loop,
+#endif
     unix_wow64_get_endpoint_ids,
     unix_wow64_create_stream,
     unix_wow64_release_stream,
     unix_start,
     unix_stop,
     unix_reset,
+#ifndef WINE_MMDEVAPI_SYSTEM_THREADS
     unix_timer_loop,
+#endif
     unix_wow64_get_render_buffer,
     unix_release_render_buffer,
     unix_wow64_get_capture_buffer,
