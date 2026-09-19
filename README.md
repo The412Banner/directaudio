@@ -277,9 +277,21 @@ cannot, so check the open log for what you actually got.
 
 ---
 
+## Linux Steam client — the relay build
+
+The one place the in-process route is **impossible**: a game running under **Valve's ARM64 Proton inside a Linux runtime on Android** (Bannerlator's linuxfs session with the native Steam client). That game process is a glibc process in a proot'd rootfs; it cannot load bionic's `libaaudio` at all, and the session gives it no way to spawn an Android process. So for that runtime there is a second build of this same source, **`-DDA_RELAY`**, where every AAudio call moves into a small helper on the Android side:
+
+```
+game (WASAPI) → winedirectaudio.so (glibc, mixer) ──memfd ring──► directaudio-relay (bionic) → AAudio → 🔊
+                                                  ◄──memfd ring──  (owns the OUTPUT + mic INPUT streams)
+                                                  ──unix socket──  (one handshake, mic start/stop)
+```
+
+The mixer, the adaptive buffering, decay, self-healing, the live-config mailbox and **microphone capture** all carry over — the AAudio-facing half runs in the helper instead of the game, and the two share lock-free rings with a futex wake so nothing polls. The price is one extra hand-off, about two bursts (≈8 ms on a 192-frame device), on top of what the in-process build pays; `get_latency` reports it honestly. It is built by [`linux.yml`](.github/workflows/linux.yml) inside Valve's own `proton_11.0` tree (its `mmdevapi` ABI is identical to Proton Experimental's and to our Wine-11 layers), gated so the game-side library can never mention AAudio. Install and proof-of-life: [`docs/linux-relay/INSTALL.md`](docs/linux-relay/INSTALL.md).
+
 ## Roadmap
 
-Ordered by value against effort. The governing constraint: **none of these may add a daemon or an IPC hop** — the short route to AAudio is the whole point.
+Ordered by value against effort. The governing constraint: **none of these may add a daemon or an IPC hop** — the short route to AAudio is the whole point. (The [relay build](#linux-steam-client--the-relay-build) is not an exception to this rule but a different runtime: it exists only where the short route cannot.)
 
 **Shipped in v1.3.0** (three items, one of them straight off this list):
 

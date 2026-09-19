@@ -1,5 +1,61 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-09-19 — relay build: DirectAudio for the Linux Steam client, with the mic (branch `feat/linux-relay-mic`)
+
+**Why.** Bannerlator's Linux runtime runs games on **Valve's ARM64 Proton** (Proton 11.0 / Proton
+Experimental, both Wine 11) inside a proot'd glibc rootfs. That game process cannot load bionic's
+`libaaudio` - the rootfs's linker does not know bionic, and our shipped `winedirectaudio.so` NEEDs
+`libc.so`/`libdl.so`/`libaaudio.so`/`liblog.so` - so the in-process premise is simply unavailable there.
+The session binds no `/system` into proot either, so the game cannot spawn an Android helper itself.
+
+**What.** A second build of the same source, `-DDA_RELAY`, with every AAudio call moved into a
+small bionic helper the host app starts on the Android side (`directaudio-relay`, one per session, any
+number of games). The two meet over a unix socket (`BANNER_AUDIO_DIRECT_RELAY`, default
+`$XDG_RUNTIME_DIR/directaudio-relay`) and two shared memfd rings passed as SCM_RIGHTS: render
+(game → helper, 48 kHz float stereo, the mixer's output) and capture (helper → game, float stereo at
+the granted input rate). A futex word on each ring means neither side polls. `da_relay_proto.h` is the
+contract (`DA_RELAY_VERSION 1`, refused on mismatch).
+
+- **Driver side** (`directaudio.c` under `#ifdef DA_RELAY`, ~400 lines): the mixer and all per-voice
+  WASAPI code are untouched; `mixer_cb`'s mixing was factored into `mix_block()` (in-process build
+  byte-for-byte equivalent) so a pump thread can call it to keep the render ring at the target the
+  helper publishes; the capture callback became a drain thread feeding the unchanged
+  `capture_fill_voice`; `test_connect` probes the socket; `get_latency` reports ring target + helper
+  buffer; the mailbox watcher and the watchdog run in the helper. `da_aaudio_compat.h` supplies the
+  AAudio enum names for a build with no AAudio headers.
+- **Helper side** (`directaudio-relay.c`, ~700 lines): per client one OUTPUT stream carrying the
+  driver's LOW_LATENCY default, adaptive growth on xruns, decay with floor/backoff, route-change and
+  transient-error reopen, stalled-callback watchdog and the `BANNER_AUDIO_DIRECT_RUNTIME` mailbox,
+  ported as-is; plus a ring-level adaptive step (a callback that finds the ring short raises the
+  driver's queue target one burst, ceiling 100 ms; start = 2 bursts). With `BANNER_AUDIO_DIRECT_MIC=1`
+  the hello asks for an INPUT stream (`VOICE_COMMUNICATION`), opened at connect and started/stopped by
+  `DA_MSG_MIC_START/STOP` exactly when the in-process build would `requestStart/Stop`. A mic the uid
+  cannot open is reported in the ack and the driver invalidates its capture endpoint, as before.
+- **Cost:** one extra hand-off (the ring, ~8 ms at 192-frame bursts) on top of what the in-process
+  build pays. Everything else - AAudio buffer, AudioFlinger's 21 ms - is unchanged.
+
+**Build.** `.github/workflows/linux.yml`: the unixlib + arm64ec/i386 PE shells are cross-built on
+x86_64 inside **ValveSoftware/wine `proton_11.0`** (native wine-tools, then `--host=aarch64-linux-gnu`
+with llvm-mingw for the PE side, `Makefile.relay.in` = `EXTRADEFS=-DDA_RELAY`, no `-laaudio`), gated by
+readelf: glibc `libc.so.6` present, nothing AAudio anywhere. The helper is built with NDK r27d at API 28
+with a 16 KB max page size (one binary for every device) and gated the other way (libaaudio present).
+ABI fact that makes one build enough: `dlls/mmdevapi/unixlib.h` is **byte-identical** across Valve
+`proton_11.0`, `experimental_11.0` and our `ge-proton11-bionic` (md5 `72b616a8…`, checked 2026-09-19).
+
+**Deploying it** (`docs/linux-relay/INSTALL.md`): the three driver files go in a side directory named
+by `WINEDLLPATH` (Steam's verify would strip anything added inside the depot), the driver is selected
+with `HKCU\Software\Wine\Drivers\Audio=directaudio` in the game's `compatdata/<appid>/pfx`, and the
+helper runs under the app's uid before the game starts. Proof it is live: `libaaudio.so` in the
+**helper's** `/proc/<pid>/maps`, none in the game's; `logcat -s DA-Relay:I`.
+
+**Status:** helper CI-green on the first run (linkage verified); the unixlib cross-build is being
+iterated in CI (first failure: the native tools configure defaulted to 32-bit - fixed). The
+in-process `ci.yml` needed one change: it now copies the two relay headers into the tree on every
+build, because makedep resolves every quoted `#include` regardless of `#ifdef`. **Not device-tested.**
+Next: local swap test on the Fold/FIT (helper started by hand as the app uid), then the app-side relay
+component - and the Linux session's pulse-only audio wiring at `XServerDisplayActivity.java:8660`,
+which currently launches the client silent for any other container driver.
+
 ## 2026-09-02 — docs: README refreshed to v1.3.2 + the seven supported layers
 
 README was still 1.3.1-era in three places. Status now reads **v1.3.2** (opt-in mic capture). The

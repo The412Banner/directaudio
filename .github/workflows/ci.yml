@@ -78,7 +78,8 @@ jobs:
           if [ "${{ matrix.abi }}" = "wine11" ]; then
             # Wine 11: mmdevapi loads the driver via the unixlib (no PE-side GUID
             # exports). Overlay the shared unix implementation + its Makefile.
-            cp -v driver/directaudio.c driver/Makefile.in wine/dlls/winedirectaudio.drv/
+            cp -v driver/directaudio.c driver/Makefile.in \
+                  driver/da_relay_proto.h driver/da_aaudio_compat.h wine/dlls/winedirectaudio.drv/
           else
             # Wine 10: the pinned proton_10.0 submodule already carries the exact
             # Wine-10 PE side P10-4 shipped (mmdevdrv.c + winedirectaudio.drv.spec +
@@ -89,6 +90,11 @@ jobs:
             grep -q 'mmdevdrv\.c' wine/dlls/winedirectaudio.drv/Makefile.in  # PE side wired in
             cp -v driver/directaudio.c wine/dlls/winedirectaudio.drv/
           fi
+          # The relay build's headers ride along on EVERY build: makedep resolves
+          # every quoted #include in the source, inactive #ifdef branches included,
+          # and refuses to generate the Makefile when one is missing. They compile
+          # to nothing here (DA_RELAY is not defined).
+          cp -v driver/da_relay_proto.h driver/da_aaudio_compat.h wine/dlls/winedirectaudio.drv/
           echo "--- winedirectaudio.drv sources for ${{ matrix.label }} ---"
           ls -la wine/dlls/winedirectaudio.drv/
           # Integration deltas (configure.ac + mmdevapi default_list) already live in

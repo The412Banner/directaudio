@@ -93,9 +93,17 @@ jobs:
           wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/${{ env.LLVM_MINGW }}.tar.xz
           tar -xf ${{ env.LLVM_MINGW }}.tar.xz
 
-      - name: Autoreconf (configure.ac changed)
+      - name: Generate Wine's derived sources + autoreconf
         working-directory: wine
-        run: autoreconf -f
+        run: |
+          set -e
+          # Valve's tree does not commit make_vulkan's output (include/wine/vulkan.h,
+          # the winevulkan thunks); makedep then refuses to generate any Makefile.
+          # Proton's own build runs exactly this first (make/rules-wine.mk).
+          python3 dlls/winevulkan/make_vulkan -x vk.xml -X video.xml
+          tools/make_specfiles || true
+          test -f include/wine/vulkan.h
+          autoreconf -f
 
       - name: Cache wine-tools
         id: cache-wine-tools
