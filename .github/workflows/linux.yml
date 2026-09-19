@@ -102,6 +102,10 @@ jobs:
           # Proton's own build runs exactly this first (make/rules-wine.mk).
           python3 dlls/winevulkan/make_vulkan -x vk.xml -X video.xml
           tools/make_specfiles || true
+          # The committed include/wine/server_protocol.h lags server/protocol.def
+          # in Valve's tree (Proton regenerates it); the unixlib links against
+          # ntdll.so, whose build needs the two to agree.
+          tools/make_requests
           test -f include/wine/vulkan.h
           autoreconf -f
 
