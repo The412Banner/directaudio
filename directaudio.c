@@ -39,6 +39,27 @@
 #include <time.h>
 #include <stdio.h>
 #include <sys/stat.h>
+
+#ifdef DA_RELAY
+/* ---- relay build (glibc, the Linux Steam client) ------------------------------
+ * The game process is a glibc process inside a proot'd rootfs and cannot load
+ * bionic's libaaudio, so this build makes NO AAudio call: every stream lives in
+ * the directaudio-relay helper on the Android side, reached over a unix socket
+ * and two shared memfd rings (see da_relay_proto.h). The mixer, the per-voice
+ * WASAPI rings and the whole mmdevapi surface are the in-process build's; only
+ * the backend behind mixer_ensure_open / capture_add_voice differs. A green
+ * build with this flag is proof by itself that the game process is AAudio-free:
+ * no AAudio header is included and no AAudio library is linked. */
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+#include "da_aaudio_compat.h"
+#include "da_relay_proto.h"
+#else
 #include <android/log.h>
 
 /* Blank the API-availability annotation before including AAudio.h so the API-28
@@ -64,6 +85,7 @@ extern __attribute__((weak)) void AAudioStreamBuilder_setUsage(AAudioStreamBuild
  * suppression / auto-gain that voice chat needs. */
 extern __attribute__((weak)) void AAudioStreamBuilder_setInputPreset(AAudioStreamBuilder *builder,
                                                                      aaudio_input_preset_t inputPreset);
+#endif /* DA_RELAY */
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -389,6 +411,19 @@ struct directaudio_mixer
     UINT64 last_xrun_ns;      /* monotonic ns of the most recent xrun climb */
     UINT64 last_decay_ns;     /* monotonic ns of the most recent step down; 0 = none yet */
     unsigned int decay_backoff; /* quiet-period multiplier, doubles when punished */
+
+#ifdef DA_RELAY
+    /* --- relay build: the output is a shared ring the helper drains ----------
+     * aq stays NULL for the life of the process. The pump thread is an ordinary
+     * thread (not an audio-priority one) that keeps the ring topped up to the
+     * target the helper publishes in the ring header, sleeping on the ring's
+     * futex word between the helper's callbacks. */
+    struct da_ring *ring;
+    int ring_fd;
+    pthread_t pump_th;
+    int pump_up;              /* pump thread running */
+    volatile int pump_quit;
+#endif
 };
 
 /* Event-level logging, ALWAYS ON. Only fires when the audio output is rebuilt -
@@ -396,7 +431,13 @@ struct directaudio_mixer
  * behind the diagnostics build. It is what makes a field report actionable:
  * "audio glitched" becomes "the driver rebuilt the stream, and here is why".
  * Per-callback heartbeats and per-call tracing stay in the diagnostics build. */
+#ifdef DA_RELAY
+/* No logcat from a glibc process: stderr is the session log under the Linux
+ * runtime, and the helper mirrors its own events to logcat under "DA-Relay". */
+#define DA_EVENT(...) do { fprintf(stderr, "DirectAudio: " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#else
 #define DA_EVENT(...) __android_log_print(ANDROID_LOG_INFO, "DirectAudio", __VA_ARGS__)
+#endif
 
 #define DA_FREEZE_GAP_NS  500000000ull   /* tick gap this large => guest was suspended */
 #define DA_CB_STALL_NS   1000000000ull   /* callback silent this long => stream is dead */
@@ -573,14 +614,12 @@ static void mix_voice(struct directaudio_stream *v, float *out, int32_t numFrame
     pthread_mutex_unlock(&v->lock);
 }
 
-/* AAudio pulls from the single mixed output on its high-priority audio thread. */
-static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
-                                              void *audioData, int32_t numFrames)
+/* Produce numFrames of the mixed output: sum every voice, then the limiter.
+ * Called from the AAudio data callback in the in-process build and from the
+ * relay pump thread in the relay build; the samples are identical either way. */
+static void mix_block(struct directaudio_mixer *mx, float *out, int32_t numFrames)
 {
-    struct directaudio_mixer *mx = user;
-    float *out = audioData;
     int32_t i, n2 = numFrames * MIX_OUT_CHANNELS;
-    UINT64 now;
 
     memset(out, 0, (size_t)n2 * sizeof(float));
 
@@ -613,6 +652,17 @@ static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
             out[i] = x < 0.0f ? -y : y;
         }
     }
+}
+
+#ifndef DA_RELAY
+/* AAudio pulls from the single mixed output on its high-priority audio thread. */
+static aaudio_data_callback_result_t mixer_cb(AAudioStream *aq, void *user,
+                                              void *audioData, int32_t numFrames)
+{
+    struct directaudio_mixer *mx = user;
+    UINT64 now;
+
+    mix_block(mx, audioData, numFrames);
 
     /* Everything past this point is bookkeeping on state the MIXER owns - liveness,
      * xrun baseline, buffer sizing - and only the live stream may touch it. A stream
@@ -790,7 +840,9 @@ static void mixer_error_cb(AAudioStream *aq, void *user, aaudio_result_t error)
 
     mixer_request_reopen(mx, "stream error");
 }
+#endif /* !DA_RELAY */
 
+#ifndef DA_RELAY
 /* Overlay any live runtime overrides onto the mixer's config. Called at the top
  * of every open (first open AND each reopen), so a mailbox change takes effect
  * the next time the stream is built. An ms buffer wins over a frame count (as it
@@ -809,6 +861,7 @@ static void da_apply_runtime_overrides(struct directaudio_mixer *mx)
     else if (da_rt_perf == 2) mx->perf = AAUDIO_PERFORMANCE_MODE_POWER_SAVING;
     /* da_rt_perf == -1: unset, keep the launch perf */
 }
+#endif /* !DA_RELAY */
 
 /* Parse the KEY=VALUE mailbox file into the override globals. Values <=0 (or out
  * of range for perf) clear the override, so removing a line reverts to launch
@@ -838,9 +891,12 @@ static void da_read_runtime_file(void)
     fclose(f);
 }
 
+#ifndef DA_RELAY
 /* The mailbox watcher: a lazy 1 s poll, OFF the real-time audio path. 99.9% of
  * ticks are a single stat() that finds nothing changed; only an actual edit
- * triggers a re-read + a live reopen. This is the whole cost of live control. */
+ * triggers a re-read + a live reopen. This is the whole cost of live control.
+ * (Relay build: the helper watches the same file itself - the path travels in
+ * the hello - so the game process runs no watcher.) */
 static void *da_config_watch_thread(void *unused)
 {
     struct timespec iv = { 1, 0 };
@@ -1053,13 +1109,26 @@ static void *mixer_reopen_thread(void *user)
     }
     return NULL;
 }
+#endif /* !DA_RELAY */
+
+#ifdef DA_RELAY
+static int relay_connect(const struct directaudio_stream *cfg);
+static struct da_ring *relay_out_ring(void);
+static struct da_ring *relay_in_ring(int32_t *rate);
+static void *relay_pump_thread(void *user);
+#endif
 
 /* open the shared output on the first voice, using that voice's env-derived config */
 static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
                                          const struct directaudio_stream *cfg)
 {
+#ifdef DA_RELAY
+    if (mx->pump_up)
+        return AAUDIO_OK;
+#else
     if (mx->aq)
         return AAUDIO_OK;
+#endif
     mx->perf = cfg->aa_perf;
     mx->share = cfg->aa_share;
     mx->adaptive = cfg->adaptive;
@@ -1070,7 +1139,22 @@ static aaudio_result_t mixer_ensure_open(struct directaudio_mixer *mx,
     /* The ceiling needs no burst rounding - it only clamps growth and sizes the
      * capacity request, both of which happen in whole frames. */
     if (cfg->max_ms > 0) mx->max_buf_frames = cfg->max_ms * MIX_OUT_RATE / 1000;
+#ifdef DA_RELAY
+    /* The helper opens the real stream with this config; what comes back is a
+     * ring to keep full. The pump is the relay build's data callback. */
+    if (relay_connect(cfg) != 0 || !(mx->ring = relay_out_ring()))
+        return AAUDIO_ERROR_UNAVAILABLE;
+    mx->pump_quit = 0;
+    if (pthread_create(&mx->pump_th, NULL, relay_pump_thread, mx) != 0)
+    {
+        DA_EVENT("relay: pump thread create failed");
+        return AAUDIO_ERROR_INTERNAL;
+    }
+    mx->pump_up = 1;
+    return AAUDIO_OK;
+#else
     return mixer_open_stream(mx, &mx->aq);
+#endif
 }
 
 static aaudio_result_t mixer_add_voice(struct directaudio_mixer *mx, struct directaudio_stream *v)
@@ -1216,6 +1300,17 @@ struct directaudio_capture
 
     unsigned int cb_count;
     UINT64 last_cb_ns;
+
+#ifdef DA_RELAY
+    /* --- relay build: the input is a shared ring the helper fills -----------
+     * aq stays NULL. A drain thread moves blocks from the ring into every
+     * capture voice through the same capture_fill_voice the callback used. */
+    struct da_ring *ring;
+    int ring_fd;
+    pthread_t drain_th;
+    int drain_up;
+    volatile int drain_quit;
+#endif
 };
 static struct directaudio_capture g_capture = { PTHREAD_MUTEX_INITIALIZER };
 
@@ -1331,6 +1426,7 @@ static void capture_fill_voice(struct directaudio_capture *cap, struct directaud
     pthread_mutex_unlock(&v->lock);
 }
 
+#ifndef DA_RELAY
 /* AAudio pushes captured input on its high-priority thread. */
 static aaudio_data_callback_result_t capture_cb(AAudioStream *aq, void *user,
                                                 void *audioData, int32_t numFrames)
@@ -1498,6 +1594,12 @@ static void capture_request_reopen(struct directaudio_capture *cap, const char *
             pthread_detach(th);
     }
 }
+#endif /* !DA_RELAY */
+
+#ifdef DA_RELAY
+static int relay_send_msg(uint32_t type, int32_t arg);
+static void *relay_capture_drain_thread(void *user);
+#endif
 
 /* open the shared input on the first capture voice (lazy: enumeration never gets
  * here). Returns the AAudio result so create_stream can fail gracefully - a mic
@@ -1508,12 +1610,39 @@ static aaudio_result_t capture_add_voice(struct directaudio_capture *cap, struct
     aaudio_result_t r = AAUDIO_OK;
 
     pthread_mutex_lock(&cap->lock);
+#ifdef DA_RELAY
+    /* The helper opened the input (not started) as part of this process's one
+     * connection, and handed back a capture ring; a mic it could not open (the
+     * uid lacks RECORD_AUDIO) leaves no ring, which fails the voice exactly as an
+     * in-process open failure would. The ring's data is float stereo at the rate
+     * the header publishes, so the fill path below converts from that. */
+    if (!cap->ring)
+    {
+        cap->perf = v->aa_perf;
+        if (relay_connect(v) != 0 || !(cap->ring = relay_in_ring(&cap->in_rate)))
+            r = AAUDIO_ERROR_UNAVAILABLE;
+        else
+        {
+            cap->in_channels = DA_RING_CHANNELS;
+            cap->in_format = AAUDIO_FORMAT_PCM_FLOAT;
+        }
+    }
+    if (r == AAUDIO_OK && !cap->drain_up)
+    {
+        cap->drain_quit = 0;
+        if (pthread_create(&cap->drain_th, NULL, relay_capture_drain_thread, cap) != 0)
+            r = AAUDIO_ERROR_INTERNAL;
+        else
+            cap->drain_up = 1;
+    }
+#else
     if (!cap->aq)
     {
         cap->perf = v->aa_perf;
         r = capture_open_stream(cap, &cap->aq);
         if (r == AAUDIO_OK) capture_note_geometry(cap, cap->aq);
     }
+#endif
     if (r == AAUDIO_OK)
     {
         if (cap->nvoices < MIX_MAX_VOICES)
@@ -1548,16 +1677,28 @@ static void capture_remove_voice(struct directaudio_capture *cap, struct directa
      * next capture client reuses it; requestStart is valid again from STOPPED.
      * requestStop must run OUTSIDE the lock - it can wait on the callback, which
      * takes the lock - so mark the intent here and act after unlock. */
+#ifdef DA_RELAY
+    if (cap->nvoices == 0 && cap->ring && cap->started)
+    {
+        stop = (AAudioStream *)cap;   /* any non-NULL: "send the stop" */
+        cap->started = 0;
+    }
+#else
     if (cap->nvoices == 0 && cap->aq && cap->started)
     {
         stop = cap->aq;
         cap->started = 0;
     }
+#endif
     pthread_mutex_unlock(&cap->lock);
 
     if (stop)
     {
+#ifdef DA_RELAY
+        relay_send_msg(DA_MSG_MIC_STOP, 0);
+#else
         AAudioStream_requestStop(stop);
+#endif
         DA_EVENT("capture stop: no voices");
     }
 }
@@ -1567,6 +1708,31 @@ static void capture_remove_voice(struct directaudio_capture *cap, struct directa
  * callback's cap->lock -> v->lock order. */
 static void capture_ensure_started(struct directaudio_capture *cap)
 {
+#ifdef DA_RELAY
+    int start = 0;
+
+    pthread_mutex_lock(&cap->lock);
+    if (cap->ring && !cap->started)
+    {
+        cap->started = 1;
+        start = 1;
+    }
+    pthread_mutex_unlock(&cap->lock);
+
+    /* The helper starts the input; its own log says whether that worked. A
+     * failed send means the helper is gone, and every voice is dead with it. */
+    if (start)
+    {
+        if (relay_send_msg(DA_MSG_MIC_START, 0) != 0)
+        {
+            WARN("capture start: relay send failed\n");
+            pthread_mutex_lock(&cap->lock);
+            cap->started = 0;
+            pthread_mutex_unlock(&cap->lock);
+        }
+        else DA_EVENT("capture start (relay)");
+    }
+#else
     AAudioStream *aq = NULL;
 
     pthread_mutex_lock(&cap->lock);
@@ -1589,7 +1755,348 @@ static void capture_ensure_started(struct directaudio_capture *cap)
         }
         else DA_EVENT("capture start");
     }
+#endif
 }
+
+#ifdef DA_RELAY
+/* ===================== relay transport ======================================
+ * One connection per process, made lazily by whichever side needs it first
+ * (render or capture), carrying the launch config of that first voice - every
+ * voice reads the same environment, so it makes no difference which. The
+ * helper answers with the rings; from then on the socket only carries the mic
+ * start/stop messages, and its EOF tells the helper the game is gone. */
+
+#define RELAY_CHUNK_FRAMES 480   /* 10 ms at 48 kHz: the most produced or drained per step */
+
+static struct
+{
+    pthread_mutex_t lock;
+    int fd;                      /* -1 until connected */
+    int failed;                  /* one failed attempt is final for this process */
+    struct da_ack ack;
+    struct da_ring *out_ring, *in_ring;
+    int out_fd, in_fd;
+} g_relay = { PTHREAD_MUTEX_INITIALIZER, -1, 0, { 0 }, NULL, NULL, -1, -1 };
+
+static void relay_socket_path(char *buf, size_t len)
+{
+    const char *e = getenv(DA_RELAY_ENV);
+
+    if (e && *e) { snprintf(buf, len, "%s", e); return; }
+    e = getenv("XDG_RUNTIME_DIR");
+    snprintf(buf, len, "%s/%s", e && *e ? e : "/tmp", DA_RELAY_DEFAULT_NAME);
+}
+
+static int relay_open_socket(void)
+{
+    struct sockaddr_un addr;
+    char path[sizeof(addr.sun_path)];
+    int fd;
+
+    relay_socket_path(path, sizeof(path));
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, path, strlen(path) + 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
+static int relay_write_full(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+
+    while (len)
+    {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        p += n; len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int relay_recv_ack(int fd, struct da_ack *ack, int *fds, int *nfds)
+{
+    struct msghdr msg;
+    struct iovec iov;
+    char cbuf[CMSG_SPACE(sizeof(int) * 2)];
+    struct cmsghdr *cm;
+    ssize_t n;
+
+    memset(&msg, 0, sizeof(msg));
+    memset(cbuf, 0, sizeof(cbuf));
+    iov.iov_base = ack;
+    iov.iov_len = sizeof(*ack);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+    do n = recvmsg(fd, &msg, MSG_WAITALL); while (n < 0 && errno == EINTR);
+    if (n != (ssize_t)sizeof(*ack)) return -1;
+
+    *nfds = 0;
+    for (cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm))
+    {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
+        {
+            int k = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            if (k > 2) k = 2;
+            memcpy(fds, CMSG_DATA(cm), sizeof(int) * (size_t)k);
+            *nfds = k;
+        }
+    }
+    return 0;
+}
+
+static struct da_ring *relay_map_ring(int fd)
+{
+    struct da_ring hdr;
+    struct da_ring *r;
+
+    if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr) ||
+        hdr.magic != DA_RING_MAGIC || hdr.version != DA_RELAY_VERSION || !hdr.cap_frames)
+        return NULL;
+    r = mmap(NULL, da_ring_bytes(hdr.cap_frames), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    return r == MAP_FAILED ? NULL : r;
+}
+
+static int relay_connect(const struct directaudio_stream *cfg)
+{
+    struct da_hello h;
+    int fds[2] = { -1, -1 }, nfds = 0, fd, rc = -1;
+
+    pthread_mutex_lock(&g_relay.lock);
+    if (g_relay.fd >= 0) { rc = 0; goto out; }
+    if (g_relay.failed) goto out;
+
+    fd = relay_open_socket();
+    if (fd < 0)
+    {
+        char path[108];
+        relay_socket_path(path, sizeof(path));
+        DA_EVENT("relay: cannot reach the helper at %s (%d) - is directaudio-relay running?", path, errno);
+        g_relay.failed = 1;
+        goto out;
+    }
+
+    memset(&h, 0, sizeof(h));
+    h.magic = DA_HELLO_MAGIC;
+    h.version = DA_RELAY_VERSION;
+    h.perf = cfg->aa_perf == AAUDIO_PERFORMANCE_MODE_NONE ? 0 :
+             cfg->aa_perf == AAUDIO_PERFORMANCE_MODE_POWER_SAVING ? 2 : 1;
+    if (cfg->aa_share == AAUDIO_SHARING_MODE_EXCLUSIVE) h.flags |= DA_HELLO_EXCLUSIVE;
+    if (cfg->adaptive)   h.flags |= DA_HELLO_ADAPTIVE;
+    if (cfg->decay)      h.flags |= DA_HELLO_DECAY;
+    if (da_watchdog)     h.flags |= DA_HELLO_WATCHDOG;
+    if (da_mic_enabled)  h.flags |= DA_HELLO_MIC;
+    h.target_ms = cfg->target_ms;
+    h.max_ms = cfg->max_ms;
+    h.target_frames = cfg->target_buf_frames;
+    h.max_frames = cfg->max_buf_frames;
+    h.stall_ms = (uint32_t)(da_stall_ns / 1000000ull);
+    h.quiet_ms = (uint32_t)(da_quiet_ns / 1000000ull);
+    h.punish_ms = (uint32_t)(da_punish_ns / 1000000ull);
+    h.max_backoff = da_max_backoff;
+    h.pid = (int32_t)getpid();
+    h.log = (uint32_t)da_log;
+    if (da_rt_path[0])
+    {
+        size_t n = strlen(da_rt_path);
+        if (n >= sizeof(h.runtime_path)) n = sizeof(h.runtime_path) - 1;
+        memcpy(h.runtime_path, da_rt_path, n);
+    }
+    {
+        FILE *f = fopen("/proc/self/comm", "r");
+        if (f)
+        {
+            if (fgets(h.name, sizeof(h.name), f)) h.name[strcspn(h.name, "\n")] = 0;
+            fclose(f);
+        }
+    }
+
+    if (relay_write_full(fd, &h, sizeof(h)) != 0 ||
+        relay_recv_ack(fd, &g_relay.ack, fds, &nfds) != 0 ||
+        g_relay.ack.magic != DA_ACK_MAGIC)
+    {
+        DA_EVENT("relay: handshake failed (%d)", errno);
+        goto fail;
+    }
+    if (g_relay.ack.status != 0)
+    {
+        DA_EVENT("relay: helper refused: %d", g_relay.ack.status);
+        goto fail;
+    }
+    if (nfds < 1 || !(g_relay.out_ring = relay_map_ring(fds[0])))
+    {
+        DA_EVENT("relay: bad render ring from helper");
+        goto fail;
+    }
+    g_relay.out_fd = fds[0];
+    if (g_relay.ack.in_cap_frames > 0 && nfds > 1)
+    {
+        if ((g_relay.in_ring = relay_map_ring(fds[1])))
+            g_relay.in_fd = fds[1];
+        else
+        {
+            DA_EVENT("relay: bad capture ring from helper - mic unavailable");
+            close(fds[1]);
+        }
+    }
+    else if (nfds > 1) close(fds[1]);
+
+    g_relay.fd = fd;
+    DA_EVENT("relay: connected - out %d/%d frames burst %d buf %d (%d ms) ring target %d; mic %s",
+             g_relay.ack.rate, g_relay.ack.out_cap_frames, g_relay.ack.burst, g_relay.ack.buf_frames,
+             g_relay.ack.buf_frames * 1000 / (g_relay.ack.rate > 0 ? g_relay.ack.rate : MIX_OUT_RATE),
+             g_relay.out_ring->target_frames,
+             g_relay.in_ring ? "ring ready" :
+             (g_relay.ack.flags & DA_ACK_MIC_FAILED) ? "FAILED to open" :
+             da_mic_enabled ? "not provided" : "off");
+    rc = 0;
+    goto out;
+
+fail:
+    if (fds[0] >= 0) close(fds[0]);
+    if (fds[1] >= 0) close(fds[1]);
+    close(fd);
+    g_relay.failed = 1;
+out:
+    pthread_mutex_unlock(&g_relay.lock);
+    return rc;
+}
+
+static struct da_ring *relay_out_ring(void)
+{
+    return g_relay.out_ring;
+}
+
+static struct da_ring *relay_in_ring(int32_t *rate)
+{
+    if (!g_relay.in_ring) return NULL;
+    *rate = g_relay.ack.in_rate > 0 ? g_relay.ack.in_rate : MIX_OUT_RATE;
+    return g_relay.in_ring;
+}
+
+static int relay_send_msg(uint32_t type, int32_t arg)
+{
+    struct da_msg m;
+    int rc = -1;
+
+    m.type = type;
+    m.arg = arg;
+    pthread_mutex_lock(&g_relay.lock);
+    if (g_relay.fd >= 0)
+        rc = relay_write_full(g_relay.fd, &m, sizeof(m));
+    pthread_mutex_unlock(&g_relay.lock);
+    return rc;
+}
+
+/* Sleep until the other side bumps the ring's wake word or the timeout passes.
+ * A shared (non-private) futex, since the waker is another process. */
+static void relay_futex_wait(volatile uint32_t *word, uint32_t seen, long timeout_ns)
+{
+    struct timespec ts = { 0, timeout_ns };
+    syscall(SYS_futex, word, FUTEX_WAIT, seen, &ts, NULL, 0);
+}
+
+/* The relay build's data callback: keep the render ring filled to the target
+ * the helper publishes. Runs as an ordinary thread. Each pass mixes only what
+ * is missing, in RELAY_CHUNK_FRAMES steps, then waits for the helper's next
+ * consume (or 4 ms, one reference-device burst, whichever is first). */
+static void *relay_pump_thread(void *user)
+{
+    struct directaudio_mixer *mx = user;
+    struct da_ring *r = mx->ring;
+    float tmp[RELAY_CHUNK_FRAMES * MIX_OUT_CHANNELS];
+    uint32_t cap = r->cap_frames;
+
+    while (!__atomic_load_n(&mx->pump_quit, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&r->quit, __ATOMIC_ACQUIRE))
+    {
+        uint32_t seen = __atomic_load_n(&r->wake, __ATOMIC_ACQUIRE);
+        uint32_t widx = __atomic_load_n(&r->widx, __ATOMIC_RELAXED);
+        uint32_t target = (uint32_t)__atomic_load_n(&r->target_frames, __ATOMIC_ACQUIRE);
+        uint32_t avail = widx - __atomic_load_n(&r->ridx, __ATOMIC_ACQUIRE);
+
+        if (target > cap) target = cap;
+        while (avail < target && !__atomic_load_n(&mx->pump_quit, __ATOMIC_ACQUIRE))
+        {
+            uint32_t need = target - avail;
+            uint32_t n = need < RELAY_CHUNK_FRAMES ? need : RELAY_CHUNK_FRAMES;
+            uint32_t slot = widx % cap;
+            uint32_t first = cap - slot < n ? cap - slot : n;
+
+            mix_block(mx, tmp, (int32_t)n);
+            memcpy(&r->data[(size_t)slot * MIX_OUT_CHANNELS], tmp,
+                   (size_t)first * MIX_OUT_CHANNELS * sizeof(float));
+            if (n > first)
+                memcpy(r->data, tmp + (size_t)first * MIX_OUT_CHANNELS,
+                       (size_t)(n - first) * MIX_OUT_CHANNELS * sizeof(float));
+            widx += n;
+            __atomic_store_n(&r->widx, widx, __ATOMIC_RELEASE);
+            avail = widx - __atomic_load_n(&r->ridx, __ATOMIC_ACQUIRE);
+        }
+        __atomic_add_fetch(&mx->cb_count, 1, __ATOMIC_RELAXED);
+        relay_futex_wait(&r->wake, seen, 4 * 1000 * 1000);
+    }
+    return NULL;
+}
+
+/* The relay build's input callback: move every block the helper queued into
+ * the capture voices through the same converter the in-process callback used. */
+static void *relay_capture_drain_thread(void *user)
+{
+    struct directaudio_capture *cap = user;
+    struct da_ring *r = cap->ring;
+    float tmp[RELAY_CHUNK_FRAMES * DA_RING_CHANNELS];
+    uint32_t capn = r->cap_frames;
+
+    while (!__atomic_load_n(&cap->drain_quit, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&r->quit, __ATOMIC_ACQUIRE))
+    {
+        uint32_t seen = __atomic_load_n(&r->wake, __ATOMIC_ACQUIRE);
+        uint32_t ridx = __atomic_load_n(&r->ridx, __ATOMIC_RELAXED);
+        uint32_t avail = __atomic_load_n(&r->widx, __ATOMIC_ACQUIRE) - ridx;
+
+        while (avail)
+        {
+            uint32_t n = avail < RELAY_CHUNK_FRAMES ? avail : RELAY_CHUNK_FRAMES;
+            uint32_t slot = ridx % capn;
+            uint32_t first = capn - slot < n ? capn - slot : n;
+            int i;
+
+            memcpy(tmp, &r->data[(size_t)slot * DA_RING_CHANNELS],
+                   (size_t)first * DA_RING_CHANNELS * sizeof(float));
+            if (n > first)
+                memcpy(tmp + (size_t)first * DA_RING_CHANNELS, r->data,
+                       (size_t)(n - first) * DA_RING_CHANNELS * sizeof(float));
+            ridx += n;
+            __atomic_store_n(&r->ridx, ridx, __ATOMIC_RELEASE);
+
+            pthread_mutex_lock(&cap->lock);
+            /* The helper republishes the rate if a reopen on another route
+             * changed it (a Bluetooth headset mic, say), so read it per block. */
+            cap->in_rate = (int32_t)__atomic_load_n(&r->rate, __ATOMIC_ACQUIRE);
+            if (cap->in_rate <= 0) cap->in_rate = MIX_OUT_RATE;
+            for (i = 0; i < cap->nvoices; i++)
+                capture_fill_voice(cap, cap->voices[i], tmp, (int32_t)n);
+            pthread_mutex_unlock(&cap->lock);
+            __atomic_add_fetch(&cap->cb_count, 1, __ATOMIC_RELAXED);
+
+            avail = __atomic_load_n(&r->widx, __ATOMIC_ACQUIRE) - ridx;
+        }
+        relay_futex_wait(&r->wake, seen, 10 * 1000 * 1000);
+    }
+    return NULL;
+}
+#endif /* DA_RELAY */
 
 /* Process-wide tuning, read once at DLL attach rather than per stream: the guest
  * asks for the device period before it creates anything, and the watchdog/decay
@@ -1666,15 +2173,18 @@ static NTSTATUS unix_process_attach(void *args)
 #endif
     read_global_config_from_env();
 
+#ifndef DA_RELAY
     /* Start the mailbox watcher only if a runtime file was configured. Detached:
      * it runs for the process lifetime and is never joined. A failed spawn just
-     * means no live control (env-at-launch still works), so it is non-fatal. */
+     * means no live control (env-at-launch still works), so it is non-fatal.
+     * (Relay build: the helper watches the file; the path goes in the hello.) */
     if (da_rt_path[0])
     {
         pthread_t th;
         if (pthread_create(&th, NULL, da_config_watch_thread, NULL) == 0)
             pthread_detach(th);
     }
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -1688,6 +2198,26 @@ static NTSTATUS unix_main_loop(void *args)
 static NTSTATUS unix_test_connect(void *args)
 {
     struct test_connect_params *params = args;
+#ifdef DA_RELAY
+    /* Available iff a helper is listening. A probe connect that is closed
+     * without a hello costs the helper nothing. mmdevapi asks this once at
+     * driver selection, so a helper started after the game will not be found -
+     * the host starts it with the session, as it does its PulseAudio daemon. */
+    int fd = relay_open_socket();
+
+    if (fd >= 0)
+    {
+        close(fd);
+        params->priority = Priority_Preferred;
+    }
+    else
+    {
+        char path[108];
+        relay_socket_path(path, sizeof(path));
+        DA_EVENT("relay: helper not reachable at %s (%d) - driver unavailable", path, errno);
+        params->priority = Priority_Unavailable;
+    }
+#else
     AAudioStreamBuilder *builder = NULL;
 
     if (AAudio_createStreamBuilder(&builder) == AAUDIO_OK && builder)
@@ -1697,6 +2227,7 @@ static NTSTATUS unix_test_connect(void *args)
     }
     else
         params->priority = Priority_Unavailable;
+#endif
 
     return STATUS_SUCCESS;
 }
@@ -2096,7 +2627,14 @@ static NTSTATUS unix_get_latency(void *args)
     int32_t buf_frames;
 
     pthread_mutex_lock(&stream->lock);
+#ifdef DA_RELAY
+    /* What this driver controls under the relay: the ring it keeps queued plus
+     * the helper's AAudio buffer, both live values from the ring header. */
+    buf_frames = g_mixer.ring ? __atomic_load_n(&g_mixer.ring->hw_buf_frames, __ATOMIC_ACQUIRE) +
+                                __atomic_load_n(&g_mixer.ring->target_frames, __ATOMIC_ACQUIRE) : 0;
+#else
     buf_frames = g_mixer.aq ? AAudioStream_getBufferSizeInFrames(g_mixer.aq) : 0;
+#endif
     if (buf_frames < 0) buf_frames = 0;
     /* pretend we process audio in Period chunks, so max latency includes it */
     *params->latency = muldiv(buf_frames, 10000000, stream->fmt->nSamplesPerSec) + stream->period;
@@ -2202,6 +2740,13 @@ static NTSTATUS unix_reset(void *args)
  * the AAudio data callback stops firing after AudioTrack disables itself
  * ("disabled due to previous underrun"), leaving playing=1, the guest ring full
  * and permanent silence. Device-proven trigger: rapid background/foreground. */
+#ifdef DA_RELAY
+/* The helper owns the stream and runs this same watchdog on it. */
+static void mixer_watchdog(struct directaudio_mixer *mx)
+{
+    (void)mx;
+}
+#else
 static void mixer_watchdog(struct directaudio_mixer *mx)
 {
     UINT64 now = da_now_ns(), last_cb, prev_tick;
@@ -2239,6 +2784,7 @@ static void mixer_watchdog(struct directaudio_mixer *mx)
     __atomic_store_n(&mx->last_cb_ns, now, __ATOMIC_SEQ_CST);  /* arm one shot */
     mixer_request_reopen(mx, "data callback stalled");
 }
+#endif /* !DA_RELAY */
 
 static NTSTATUS unix_timer_loop(void *args)
 {

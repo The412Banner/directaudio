@@ -1,0 +1,13 @@
+MODULE    = winedirectaudio.drv
+UNIXLIB   = winedirectaudio.so
+IMPORTS   = uuid ole32 user32 advapi32
+DELAYIMPORTS = winmm
+# Relay build (the glibc unixlib for the Linux Steam client): every AAudio call
+# lives in the directaudio-relay helper, so libaaudio is deliberately NOT linked
+# and no AAudio header is included. A surviving in-process AAudio reference is a
+# build error by design. The CI copies this file over Makefile.in for this build.
+EXTRADEFS = -DDA_RELAY
+UNIX_LIBS = $(PTHREAD_LIBS)
+
+SOURCES = \
+	directaudio.c

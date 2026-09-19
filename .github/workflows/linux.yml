@@ -1,0 +1,293 @@
+name: build driver (Linux Steam client relay)
+
+# The DirectAudio driver for a glibc Wine: Valve's own ARM64 Proton as the
+# Linux Steam client runs it on Android (Bannerlator's linuxfs runtime). Two
+# products, built by two jobs:
+#
+#   unixlib  winedirectaudio.so (aarch64 glibc, -DDA_RELAY: NO AAudio) plus the
+#            arm64ec + i386 PE shells, built inside ValveSoftware/wine at the
+#            proton_11.0 branch, whose dlls/mmdevapi/unixlib.h is byte-identical
+#            to experimental_11.0 and to our ge-proton11-bionic (checked
+#            2026-09-19), so one build serves both ARM64 depots.
+#   relay    directaudio-relay (aarch64 bionic, API 28, 16 KB-page safe): the
+#            helper that owns every AAudio stream on the Android side.
+#
+# The unixlib is CROSS-compiled from x86_64 exactly the way the bionic build is:
+# native wine-tools first, then a --host=aarch64-linux-gnu configure of the same
+# tree with the PE side on llvm-mingw. Only the driver's own targets are made.
+#
+# Provenance rule, same as ci.yml: a green build proves the artifact compiled
+# and links against the declared libraries and nothing else; the readelf step
+# below is what enforces "no AAudio in the game process". On-device audio is
+# verified separately.
+
+on:
+  push:
+    branches: [ main, 'feat/linux-*' ]
+    tags: [ 'directaudio-linux-v*' ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  WINE_REPO: ValveSoftware/wine
+  WINE_REF: proton_11.0
+  LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  unixlib:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h | head -2
+
+      - name: Checkout Valve's Wine tree (${{ env.WINE_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WINE_REPO }}
+          ref: ${{ env.WINE_REF }}
+          path: wine
+          fetch-depth: 1
+
+      - name: Checkout this driver (source under test)
+        uses: actions/checkout@v4
+        with:
+          path: driver
+
+      - name: Overlay the driver into the Wine tree
+        run: |
+          set -e
+          mkdir -p wine/dlls/winedirectaudio.drv
+          cp -v driver/directaudio.c driver/da_relay_proto.h driver/da_aaudio_compat.h wine/dlls/winedirectaudio.drv/
+          cp -v driver/Makefile.relay.in wine/dlls/winedirectaudio.drv/Makefile.in
+          # Register the module with configure. Valve's tree has no directaudio
+          # integration (it is upstream Wine plus Proton); the only line the
+          # relay build needs is the makefile registration - no AAudio probe, no
+          # mmdevapi driver-list change (the driver is selected by registry).
+          grep -q 'WINE_CONFIG_MAKEFILE(dlls/winedirectaudio.drv)' wine/configure.ac || \
+            sed -i 's|^WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)$|WINE_CONFIG_MAKEFILE(dlls/winedirectaudio.drv)\nWINE_CONFIG_MAKEFILE(dlls/winepulse.drv)|' wine/configure.ac
+          grep -n 'winedirectaudio' wine/configure.ac
+          echo "--- ABI header this build compiles against ---"
+          sha256sum wine/dlls/mmdevapi/unixlib.h
+          ls -la wine/dlls/winedirectaudio.drv/
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip flex bison gettext autoconf \
+            pkg-config ccache gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            binutils-aarch64-linux-gnu
+
+      - name: Cache LLVM MinGW toolchain
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/${{ env.LLVM_MINGW }}
+          key: bylaws-llvm-mingw-20250920
+      - name: Set up LLVM MinGW toolchain
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $HOME/toolchains && cd $HOME/toolchains
+          wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/${{ env.LLVM_MINGW }}.tar.xz
+          tar -xf ${{ env.LLVM_MINGW }}.tar.xz
+
+      - name: Autoreconf (configure.ac changed)
+        working-directory: wine
+        run: autoreconf -f
+
+      - name: Cache wine-tools
+        id: cache-wine-tools
+        uses: actions/cache@v4
+        with:
+          path: wine/wine-tools
+          key: wine-tools-linux-${{ env.WINE_REF }}-${{ hashFiles('wine/configure.ac') }}
+      - name: Build wine-tools (native)
+        if: steps.cache-wine-tools.outputs.cache-hit != 'true'
+        working-directory: wine
+        run: |
+          set -e
+          mkdir -p wine-tools && cd wine-tools
+          ../configure --without-x --without-freetype --without-gstreamer --without-vulkan \
+                       --without-wayland --without-mingw --disable-tests
+          make -j"$(nproc)" __tooldeps__ nls/all
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-da-linux-${{ github.sha }}
+          restore-keys: |
+            ccache-da-linux-
+
+      - name: Configure (aarch64 glibc unix side, llvm-mingw PE side)
+        working-directory: wine
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PATH="$HOME/toolchains/${{ env.LLVM_MINGW }}/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 2G >/dev/null || true
+          export CC="ccache aarch64-linux-gnu-gcc"
+          export CFLAGS="-g0 -O2"
+          export CROSSCFLAGS="-g0 -O2"
+          ./configure \
+            --host=aarch64-linux-gnu --build=x86_64-linux-gnu \
+            --with-wine-tools=wine-tools \
+            --enable-archs=arm64ec,aarch64,i386 \
+            --with-mingw=clang \
+            --enable-win64 --disable-win16 --disable-tests \
+            --without-alsa --without-capi --without-coreaudio --without-cups \
+            --without-dbus --without-ffmpeg --without-fontconfig --without-freetype \
+            --without-gcrypt --without-gettext --with-gettextpo=no --without-gphoto \
+            --without-gnutls --without-gssapi --without-gstreamer --without-inotify \
+            --without-krb5 --without-netapi --without-opencl --without-opengl \
+            --without-oss --without-pcap --without-pcsclite --without-pulse \
+            --without-sane --without-sdl --without-udev --without-unwind \
+            --without-usb --without-v4l2 --without-vulkan --without-wayland \
+            --without-xcomposite --without-xcursor --without-xfixes --without-xinerama \
+            --without-xinput --without-xinput2 --without-xrandr --without-xrender \
+            --without-xshape --without-xshm --without-xxf86vm --without-x
+          echo "--- configure summary: audio drivers ---"
+          grep -E '^(enable_winedirectaudio_drv|enable_winepulse_drv|enable_winealsa_drv)' config.log || true
+
+      - name: Build ONLY the DirectAudio driver
+        working-directory: wine
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PATH="$HOME/toolchains/${{ env.LLVM_MINGW }}/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache"
+          mapfile -t TGTS < <(grep -oE "dlls/winedirectaudio\.drv/([A-Za-z0-9_-]+-windows/winedirectaudio\.drv|winedirectaudio\.so)" Makefile | sort -u)
+          echo "discovered targets:"; printf '  %s\n' "${TGTS[@]}"
+          test "${#TGTS[@]}" -ge 2
+          echo "::group::make driver"
+          make -j"$(nproc)" "${TGTS[@]}"
+          echo "::endgroup::"
+          find dlls/winedirectaudio.drv -name 'winedirectaudio.*' ! -name '*.c' -exec ls -la {} +
+
+      - name: Collect, strip and VERIFY the artifact
+        working-directory: wine
+        shell: bash
+        run: |
+          set -eo pipefail
+          OUT="$GITHUB_WORKSPACE/out/linux-wine11"
+          mkdir -p "$OUT/aarch64-windows" "$OUT/i386-windows" "$OUT/aarch64-unix"
+          PE64=$(find . -type f -path '*/aarch64-windows/winedirectaudio.drv' | head -1)
+          PE32=$(find . -type f -path '*/i386-windows/winedirectaudio.drv'    | head -1)
+          SO=$(find . -type f -name 'winedirectaudio.so' | head -1)
+          echo "PE64=$PE64"; echo "PE32=$PE32"; echo "SO=$SO"
+          test -n "$PE64" && test -n "$PE32" && test -n "$SO"
+          cp -v "$PE64" "$OUT/aarch64-windows/winedirectaudio.drv"
+          cp -v "$PE32" "$OUT/i386-windows/winedirectaudio.drv"
+          cp -v "$SO"   "$OUT/aarch64-unix/winedirectaudio.so"
+          STRIP="$HOME/toolchains/${{ env.LLVM_MINGW }}/bin/llvm-strip"
+          "$STRIP" --strip-all "$OUT/aarch64-windows/winedirectaudio.drv" || true
+          "$STRIP" --strip-all "$OUT/i386-windows/winedirectaudio.drv"    || true
+          aarch64-linux-gnu-strip --strip-unneeded "$OUT/aarch64-unix/winedirectaudio.so"
+          echo "--- artifact ---"
+          find "$OUT" -type f -exec ls -la {} + ; find "$OUT" -type f -exec file {} +
+          echo "--- unixlib linkage (must be glibc, must NOT mention AAudio) ---"
+          aarch64-linux-gnu-readelf -d "$OUT/aarch64-unix/winedirectaudio.so" | grep -E 'NEEDED|SONAME'
+          aarch64-linux-gnu-readelf -d "$OUT/aarch64-unix/winedirectaudio.so" | grep -q 'libc\.so\.6'
+          ! aarch64-linux-gnu-readelf -d "$OUT/aarch64-unix/winedirectaudio.so" | grep -qi 'aaudio'
+          ! aarch64-linux-gnu-nm -D -u "$OUT/aarch64-unix/winedirectaudio.so" | grep -qi 'aaudio'
+          ! grep -aq 'libaaudio' "$OUT/aarch64-unix/winedirectaudio.so"
+          echo "OK: glibc unixlib, AAudio-free"
+          cp -v "$GITHUB_WORKSPACE/driver/docs/linux-relay/INSTALL.md" "$OUT/README.md" 2>/dev/null || true
+          printf 'directaudio linux-wine11 relay build\nsource %s\nwine %s@%s\nunixlib.h sha256 %s\n' \
+            "${{ github.sha }}" "${{ env.WINE_REPO }}" "${{ env.WINE_REF }}" \
+            "$(sha256sum dlls/mmdevapi/unixlib.h | cut -c1-64)" > "$OUT/version.txt"
+
+      - name: Upload unixlib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: directaudio-linux-wine11
+          path: out/linux-wine11
+          retention-days: 30
+
+  relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout this driver
+        uses: actions/checkout@v4
+
+      - name: Cache Android NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/Android/Sdk/ndk/27.3.13750724
+          key: android-ndk-r27d
+      - name: Set up Android NDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $HOME/Android/Sdk/ndk && cd $HOME/Android/Sdk/ndk
+          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Build the relay helper (bionic, API 28, 16 KB-page safe)
+        shell: bash
+        run: |
+          set -eo pipefail
+          TC="$HOME/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OUT="$GITHUB_WORKSPACE/out/relay"
+          mkdir -p "$OUT"
+          # One binary for every device: API 28 is the driver's floor, and a
+          # 16 KB max-page-size executable loads on 4 KB and 16 KB kernels alike.
+          "$TC/aarch64-linux-android28-clang" -O2 -Wall -Wextra -Wno-unused-parameter \
+            -fPIE -pie -Wl,-z,max-page-size=16384 -Wl,-z,now \
+            directaudio-relay.c -o "$OUT/directaudio-relay" -laaudio -llog -pthread
+          "$TC/llvm-strip" --strip-all "$OUT/directaudio-relay"
+          ls -la "$OUT"; file "$OUT/directaudio-relay"
+          echo "--- helper linkage (MUST carry libaaudio: it is the whole point) ---"
+          "$TC/llvm-readelf" -d "$OUT/directaudio-relay" | grep -E 'NEEDED'
+          "$TC/llvm-readelf" -d "$OUT/directaudio-relay" | grep -q 'libaaudio\.so'
+          "$TC/llvm-readelf" -l "$OUT/directaudio-relay" | grep -E 'LOAD' | head -2
+          echo "OK: bionic helper with AAudio"
+          printf 'directaudio-relay\nsource %s\nprotocol v%s\n' "${{ github.sha }}" \
+            "$(grep -oE '#define DA_RELAY_VERSION +[0-9]+' da_relay_proto.h | grep -oE '[0-9]+$')" > "$OUT/version.txt"
+
+      - name: Upload relay artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: directaudio-linux-relay
+          path: out/relay
+          retention-days: 30
+
+  release:
+    needs: [ unixlib, relay ]
+    if: startsWith(github.ref, 'refs/tags/directaudio-linux-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Stage zips
+        run: |
+          set -e
+          mkdir -p release
+          for d in artifacts/directaudio-linux-*; do
+            n=$(basename "$d")
+            (cd "$d" && zip -qr "$GITHUB_WORKSPACE/release/${n}.zip" .)
+          done
+          ls -la release
+      - name: Attach to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          body: |
+            **DirectAudio for the Linux Steam client** - the relay build.
+            - `directaudio-linux-wine11.zip` - the driver for Valve's ARM64 Proton (Proton 11.0 and
+              Proton Experimental, both Wine 11 ABI). Complete 3-file set laid out for `lib/wine/`:
+              `aarch64-windows/` + `i386-windows/` PE shells, `aarch64-unix/winedirectaudio.so`
+              (glibc, AAudio-free - it talks to the helper).
+            - `directaudio-linux-relay.zip` - `directaudio-relay`, the Android-side helper that
+              owns the AAudio output and microphone streams. Run it under the app's uid, on the
+              socket the driver is pointed at with `BANNER_AUDIO_DIRECT_RELAY`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
