@@ -48,10 +48,16 @@ with `HKCU\Software\Wine\Drivers\Audio=directaudio` in the game's `compatdata/<a
 helper runs under the app's uid before the game starts. Proof it is live: `libaaudio.so` in the
 **helper's** `/proc/<pid>/maps`, none in the game's; `logcat -s DA-Relay:I`.
 
-**Status:** helper CI-green on the first run (linkage verified); the unixlib cross-build is being
-iterated in CI (first failure: the native tools configure defaulted to 32-bit - fixed). The
-in-process `ci.yml` needed one change: it now copies the two relay headers into the tree on every
-build, because makedep resolves every quoted `#include` regardless of `#ifdef`. **Not device-tested.**
+**Status: CI-green, both workflows.** `linux.yml` run `35477434188` (commit `3548a4a7`): unixlib
+`winedirectaudio.so` 68,064 B, NEEDED = `ntdll.so` + `libc.so.6` only, zero AAudio symbols (sha256
+`415a7c2a…`); PE shells `aarch64-windows` 524,288 B / `i386-windows` 16,384 B; helper
+`directaudio-relay` NEEDED = `libaaudio.so liblog.so libdl.so libc.so` (sha256 `c8378e52…`). Three
+cross-build fixes were needed on the way, all Valve-tree hygiene, none in the driver: the native
+wine-tools configure defaults to 32-bit (`--enable-win64`); Valve does not commit `make_vulkan`'s
+output; its committed `server_protocol.h` lags `protocol.def` (`tools/make_requests`), which matters
+because the unixlib links against `ntdll.so`. The in-process `ci.yml` run `35477347162` is green on all
+four legs after one change: it now copies the two relay headers into the tree on every build, because
+makedep resolves every quoted `#include` regardless of `#ifdef`. **Not device-tested.**
 Next: local swap test on the Fold/FIT (helper started by hand as the app uid), then the app-side relay
 component - and the Linux session's pulse-only audio wiring at `XServerDisplayActivity.java:8660`,
 which currently launches the client silent for any other container driver.
