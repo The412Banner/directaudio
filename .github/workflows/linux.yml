@@ -109,8 +109,10 @@ jobs:
         run: |
           set -e
           mkdir -p wine-tools && cd wine-tools
-          ../configure --without-x --without-freetype --without-gstreamer --without-vulkan \
-                       --without-wayland --without-mingw --disable-tests
+          # --enable-win64: a plain x86_64 configure defaults to a 32-bit build and
+          # demands i386 development libraries the runner does not have.
+          ../configure --enable-win64 --without-x --without-freetype --without-gstreamer \
+                       --without-vulkan --without-wayland --without-mingw --disable-tests
           make -j"$(nproc)" __tooldeps__ nls/all
 
       - name: Cache ccache
