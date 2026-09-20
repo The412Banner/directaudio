@@ -80,6 +80,45 @@ directaudio-relay --socket <path> [--log]
 - The helper serves any number of game processes; each gets its own streams.
   It exits on `SIGTERM`; a game exiting tears down that game's streams only.
 
+## A microphone for the Steam client itself (`--mic-fifo`)
+
+The driver gives a **game** a microphone, because a game runs under Wine and
+DirectAudio is Wine's audio driver. The **Steam client** is a native program
+that never touches Wine: it reads its microphone from PulseAudio, and the
+bundled PulseAudio has no Android input module, so friends voice chat sees
+"No input devices detected". The helper closes that gap with one flag:
+
+```
+directaudio-relay --socket <path> --mic-fifo <fifo path>
+```
+
+It creates the named pipe if needed and writes the captured microphone into it as
+**raw PCM, `s16le`, `48000` Hz, `1` channel (mono)**, always that format: when the
+device grants the input at another rate (a Bluetooth headset mic is often
+16 kHz) the helper resamples, so the rate PulseAudio is told is always the rate
+the bytes really are. Load the matching source in PulseAudio:
+
+```
+load-module module-pipe-source source_name=DirectAudioMic file=<fifo path> format=s16le rate=48000 channels=1
+set-default-source DirectAudioMic
+```
+
+**One microphone, every consumer.** There is a single input stream in the helper
+and every consumer gets a copy of every block: each game's capture ring and the
+pipe. In-game voice and Steam voice chat are different features and only one of
+them transmits at a time, so the same mic reaching both is the expected
+behaviour, not a conflict. The mic is hot while at least one consumer wants it:
+a game between its first capture Start and its last capture voice going away,
+the pipe while a reader is connected *and draining*. When PulseAudio suspends an
+idle source it stops reading; the helper notices the pipe staying full for two
+seconds, releases its share of the mic (the OS recording indicator goes off), and
+probes with short silent writes until the source wakes up again. A reader that
+closes the pipe is waited for again.
+
+**What to expect in the log** (`logcat -s DA-Relay:I`): `mic-fifo: <path> ready`,
+then `mic-fifo: reader connected` when the module loads, then `mic start (mic-fifo
+wants it, N consumer(s))` / `mic stop` as consumers come and go.
+
 ## Telling the driver where the helper is
 
 ```

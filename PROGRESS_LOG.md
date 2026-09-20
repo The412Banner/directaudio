@@ -1,5 +1,28 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-09-20 — helper: `--mic-fifo`, a microphone for the Steam client itself (branch `feat/linux-relay-mic`)
+
+Requested via the Linux-runtime session with the user's approval. The relay gives a **game** a mic
+(Wine → DirectAudio), but the **Steam client** is native and reads its mic from PulseAudio, whose
+bundle has `module-aaudio-sink` and no input module - Steam's audio settings show "No input devices
+detected". The helper already owns the only Android input stream the uid can open, so it now also
+writes that capture into a named pipe for `module-pipe-source`.
+
+- **Format, fixed:** `s16le` / `48000` Hz / mono. A pipe has no clock, so the helper resamples
+  (linear, position carried across blocks) whenever the granted input rate differs; PulseAudio is
+  never told a rate the bytes are not. Load with
+  `module-pipe-source file=<fifo> format=s16le rate=48000 channels=1`.
+- **Sharing, deliberate:** the per-client INPUT stream became **one shared stream (`g_mic`)** fanned
+  out to every consumer - each game's capture ring (unchanged format/rate contract) and the pipe.
+  Hot while any consumer wants it: a game between first capture Start and last voice gone; the pipe
+  while a reader is connected *and draining*. A pipe that stays full for 2 s (PulseAudio suspended
+  the idle source) releases the mic and is probed with 10 ms silent writes every 250 ms until it
+  drains again; EPIPE waits for the next reader. Route-change reopen republishes the new rate to
+  every game ring and the FIFO resampler.
+- Protocol unchanged (`DA_RELAY_VERSION 1`); driver untouched; CI relay job unchanged.
+
+Syntax-checked; CI + device test pending.
+
 ## 2026-09-19 — relay build: DirectAudio for the Linux Steam client, with the mic (branch `feat/linux-relay-mic`)
 
 **Why.** Bannerlator's Linux runtime runs games on **Valve's ARM64 Proton** (Proton 11.0 / Proton
