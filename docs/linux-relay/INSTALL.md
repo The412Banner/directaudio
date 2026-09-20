@@ -92,7 +92,7 @@ bundled PulseAudio has no Android input module, so friends voice chat sees
 directaudio-relay --socket <path> --mic-fifo <fifo path>
 ```
 
-It creates the named pipe if needed and writes the captured microphone into it as
+It writes the captured microphone into that named pipe as
 **raw PCM, `s16le`, `48000` Hz, `1` channel (mono)**, always that format: when the
 device grants the input at another rate (a Bluetooth headset mic is often
 16 kHz) the helper resamples, so the rate PulseAudio is told is always the rate
@@ -102,6 +102,19 @@ the bytes really are. Load the matching source in PulseAudio:
 load-module module-pipe-source source_name=DirectAudioMic file=<fifo path> format=s16le rate=48000 channels=1
 set-default-source DirectAudioMic
 ```
+
+**Who owns the pipe: the reader.** `module-pipe-source` creates the FIFO when it
+loads and refuses to load if the path already exists, so the helper never
+creates it; it waits for the path to appear and opens it. Two consequences for
+a host (both device-proven 2026-09-20): delete a pipe left over from an earlier
+session *before* starting the PulseAudio daemon, and start the helper any time,
+before or after, since it simply waits. Running the helper without PulseAudio,
+against a reader of your own, means making the pipe yourself with `mkfifo`.
+
+**Do not debug the daemon as root.** A PulseAudio started by hand as root leaves
+root-owned files under the app's PulseAudio directory, and the app's own daemon
+then dies with EACCES on every launch until they are removed. Use `su` to the
+app's uid.
 
 **One microphone, every consumer.** There is a single input stream in the helper
 and every consumer gets a copy of every block: each game's capture ring and the

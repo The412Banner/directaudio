@@ -1047,9 +1047,14 @@ static void *fifo_thread(void *user)
     return NULL;
 }
 
-/* --mic-fifo <path>: create the pipe if needed, open the shared input so the
- * geometry is known, start the writer. The mic is NOT made hot here; that
- * happens when a reader shows up. */
+/* --mic-fifo <path>: open the shared input so the geometry is known and start
+ * the writer. The pipe itself belongs to the READER: PulseAudio's
+ * module-pipe-source creates it at load and refuses to load (EEXIST) if it is
+ * already there, so the helper never creates it - device-proven 2026-09-20,
+ * where a helper-made pipe won the race and the module failed. The writer just
+ * waits for the path to appear (ENOENT retries like ENXIO). A host that runs
+ * the helper with some other reader makes the pipe itself with mkfifo. The mic
+ * is NOT made hot here; that happens when a reader shows up. */
 static int fifo_setup(const char *path)
 {
     struct mic_fifo *f = calloc(1, sizeof(*f));
@@ -1062,17 +1067,12 @@ static int fifo_setup(const char *path)
     f->buf = calloc(MIC_FIFO_RING, sizeof(int16_t));
     if (!f->buf) { free(f); return -1; }
 
-    if (stat(path, &st) != 0)
-    {
-        if (mkfifo(path, 0666) != 0) { REVENT("mic-fifo: mkfifo %s: %d", path, errno); free(f->buf); free(f); return -1; }
-    }
-    else if (!S_ISFIFO(st.st_mode))
+    if (stat(path, &st) == 0 && !S_ISFIFO(st.st_mode))
     {
         REVENT("mic-fifo: %s exists and is not a FIFO", path);
         free(f->buf); free(f);
         return -1;
     }
-    chmod(path, 0666);
 
     pthread_mutex_lock(&g_mic.lock);
     r = mic_ensure_open_locked(AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
@@ -1086,8 +1086,9 @@ static int fifo_setup(const char *path)
     }
     if (pthread_create(&f->th, NULL, fifo_thread, f) != 0) { REVENT("mic-fifo: thread failed"); return -1; }
     pthread_detach(f->th);
-    REVENT("mic-fifo: %s ready - load-module module-pipe-source file=%s format=s16le rate=%d channels=1",
-           path, path, MIC_FIFO_RATE);
+    REVENT("mic-fifo: will write s16le %d Hz mono to %s once a reader creates and opens it "
+           "(module-pipe-source file=%s format=s16le rate=%d channels=1)",
+           MIC_FIFO_RATE, path, path, MIC_FIFO_RATE);
     return 0;
 }
 

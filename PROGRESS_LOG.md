@@ -21,7 +21,21 @@ writes that capture into a named pipe for `module-pipe-source`.
   every game ring and the FIFO resampler.
 - Protocol unchanged (`DA_RELAY_VERSION 1`); driver untouched; CI relay job unchanged.
 
-Syntax-checked; CI + device test pending.
+CI-green (run `35495072125`).
+
+**✅ DEVICE-PROVEN 2026-09-20 (reported by the Bannerlator Linux-runtime session, on the Pocket FIT):**
+Steam's Audio page shows a Voice section with *Input Device: Default (DirectAudioMic)* where it had
+said "No input devices detected" since the Linux client existed; the helper logged `reader connected`,
+`mic start`, then released the mic when PulseAudio's idle source stopped draining, as designed; output
+through the sink unaffected. Not yet a voice test (loopback / Steam mic test): "shows a microphone" is
+not yet "hears you". Five faults stood in the way, all on the app side (PulseAudio built with
+`ac_cv_func_mkfifo=no` so `module-pipe-source` was never built; a 17.0 module in a 13.0 daemon; a
+bundle not re-extracted because dev builds freeze versionCode; `module-pipe-source` EEXIST on a
+pipe left from an earlier session; and **the helper's `mkfifo` racing the module's** - the helper
+won, the module failed). **Fix here: the helper no longer creates the pipe.** The reader owns it:
+`module-pipe-source` creates it at load, the helper waits for the path (ENOENT retries like ENXIO)
+and opens it. A host must delete a stale pipe before the daemon starts. Also recorded: never run
+the daemon as root to debug - a root-owned `.config/pulse` kills the app's own daemon with EACCES.
 
 ## 2026-09-19 — relay build: DirectAudio for the Linux Steam client, with the mic (branch `feat/linux-relay-mic`)
 
