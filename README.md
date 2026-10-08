@@ -308,7 +308,7 @@ Three products, released together as [`directaudio-linux-v1.0.0`](https://github
 | `directaudio-linux-relay.zip` | `directaudio-relay` helper (bionic, API 28, 16 KB-page safe), also named `libdirectaudiorelay.so` | NDK r27d |
 | `directaudio-linux-sink.zip` | `module-directaudio-sink.so`, PulseAudio 13 sink for the client's own sound | NDK + PulseAudio 13 headers |
 
-The helper is interface-free: one binary serves every driver set. The relay protocol (`da_relay_proto.h`, v1) and the helper carry the fixes DroidDeck made in the field (prime before playing, fade on an underrun instead of clicking, one consumer per ring, 40 ms starting target, a device buffer of at least two bursts). Installation, selection in the prefix, the helper's command line and the microphone pipe are in [`docs/linux-relay/INSTALL.md`](docs/linux-relay/INSTALL.md).
+The helper is interface-free: one binary serves every driver set. The relay protocol (`da_relay_proto.h`, v1) is unchanged; the helper and the sink carry **the field fixes by [MaxsTechReview](https://github.com/maxjivi05) (Max)** from [Droid-Deck/DroidDeck#338](https://github.com/Droid-Deck/DroidDeck/pull/338) — prime before playing, fade on an underrun instead of clicking, one consumer per ring, a 40 ms starting target kept across reopens, a device buffer of at least two bursts, and a sink that never blocks its own thread. Those are what turned the crackle reports on 20 ms-burst devices (AYN Thor, Odin 2) around. Installation, selection in the prefix, the helper's command line and the microphone pipe are in [`docs/linux-relay/INSTALL.md`](docs/linux-relay/INSTALL.md).
 
 ## Roadmap
 
@@ -340,6 +340,8 @@ Also wanted: verification on Mali hardware, and a lower preset rung in host apps
 - **keep the copyright notice** in [`directaudio.c`](directaudio.c) intact in every copy and derivative,
 - **include the LGPL-2.1 license** ([`COPYING`](COPYING)) with any distribution,
 - **make the library source available** and **state your changes** (with dates).
+
+**Contributors.** The relay helper's and client sink's field fixes are by **MaxsTechReview** (Max, [@maxjivi05](https://github.com/maxjivi05)), from DroidDeck PR #338 — see [`AUTHORS`](AUTHORS).
 
 **Requested (courtesy):** projects that ship DirectAudio, in whole or part, are asked to credit it as *"DirectAudio by The412Banner (https://github.com/The412Banner/directaudio)"* in their docs, About screen, or release notes. See [`NOTICE`](NOTICE) and [`AUTHORS`](AUTHORS).
 
