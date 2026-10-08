@@ -20,9 +20,12 @@ name: build driver (Linux Steam client relay)
 #                                      also what 11.0-20260703-slr carries
 #   relay    directaudio-relay (aarch64 bionic, API 28, 16 KB-page safe): the
 #            helper that owns every AAudio stream on the Android side, ABI-free.
-#   sink     module-directaudio-sink.so: a PulseAudio 13 sink that feeds the
-#            relay's ring, so the Steam client's own sound shares the device
-#            stream with the games.
+#   sinks    module-directaudio-native-sink.so: DirectAudio's AAudio engine as a
+#            PulseAudio 13 sink, in-process - the Steam client's own sound one
+#            step from Android (the default to offer); and
+#            module-directaudio-sink.so: a sink that feeds the relay's ring
+#            instead, so the client shares the relay's device stream with the
+#            games ("shared output").
 #
 # The unixlib is CROSS-compiled from x86_64 exactly the way the bionic build is:
 # native wine-tools first, then a --host=aarch64-linux-gnu configure of the same
@@ -346,12 +349,12 @@ jobs:
           done
           ls -la palibs; file palibs/*
 
-      - name: Build module-directaudio-sink.so
+      - name: Build the two PulseAudio sinks
         run: |
           set -euo pipefail
           export NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
           bash pulse/build.sh "$PWD/pa13" "$PWD/palibs" "$PWD/out/sink"
-          printf 'module-directaudio-sink (PulseAudio 13, Android arm64)\nsource %s\nprotocol v%s\n' "${{ github.sha }}" \
+          printf 'module-directaudio-native-sink + module-directaudio-sink (PulseAudio 13, Android arm64)\nsource %s\nprotocol v%s\n' "${{ github.sha }}" \
             "$(grep -oE '#define DA_RELAY_VERSION +[0-9]+' da_relay_proto.h | grep -oE '[0-9]+$')" > out/sink/version.txt
 
       - name: Upload sink artifact
@@ -393,7 +396,7 @@ jobs:
             - `directaudio-linux-wine11.zip` - Valve **Proton 11.0**, **Proton Experimental**, bleeding-edge and **GE-Proton 11.x** (ValveSoftware/wine `proton_11.0`). Complete 3-file set laid out for `lib/wine/`.
             - `directaudio-linux-wine11-systhread.zip` - **Proton-CachyOS** 11.0-20260703 / 20261005 and any Wine with the system-thread mmdevapi (`main_loop_start`, no `timer_loop`). Same layout.
             - `directaudio-linux-relay.zip` - `directaudio-relay` (also as `libdirectaudiorelay.so`), the Android-side helper that owns the AAudio output and microphone streams. One binary for every set.
-            - `directaudio-linux-sink.zip` - `module-directaudio-sink.so`, the PulseAudio 13 sink that lets the Steam client's own sound share the relay's stream.
+            - `directaudio-linux-sink.zip` - two PulseAudio 13 sinks for the Steam client's own sound: `module-directaudio-native-sink.so` (DirectAudio's engine in-process, one step from Android - the default to offer) and `module-directaudio-sink.so` (feeds the relay's ring instead: "shared output").
 
             Quick test for which set a Proton needs: `nm -D --undefined-only files/lib/wine/aarch64-unix/winepulse.so | grep -c PsCreateSystemThread` - `1` means system-thread, `0` means plain Wine 11.
         env:

@@ -19,7 +19,7 @@ DirectAudio game → winedirectaudio.drv → in-process mixer ──────
 
 ## Status
 
-Device-proven, shipping. Current release **v1.4.0** — built for **three Wine audio interfaces** (Wine 10, Wine 11, and Wine 11 with the *system-thread* mmdevapi that Proton-CachyOS carries; see [Compatibility](#compatibility)) — plus a separate **relay build for the Linux Steam client** (`directaudio-linux-v1.0.0`, see [below](#linux-steam-client--the-relay-build)). Output: 48 kHz · float · stereo.
+Device-proven, shipping. Current release **v1.4.0** — built for **three Wine audio interfaces** (Wine 10, Wine 11, and Wine 11 with the *system-thread* mmdevapi that Proton-CachyOS carries; see [Compatibility](#compatibility)) — plus a separate **relay build for the Linux Steam client** (`directaudio-linux-v1.1.0`, see [below](#linux-steam-client--the-relay-build)). Output: 48 kHz · float · stereo.
 
 ---
 
@@ -297,16 +297,16 @@ game (guest WASAPI) → winedirectaudio.so (glibc, mixes in-process) ──memfd
 
 - **What stays direct:** every voice is still mixed, converted and resampled **inside the game's driver**; what crosses to the helper is finished 48 kHz float stereo in a shared-memory ring, woken by a futex — no PulseAudio protocol, no daemon in the game's path. The helper owns the one AAudio output stream (and the microphone) with the driver's own adaptive / self-healing logic, and because it runs **outside** proot it gets Android's 4 ms bursts where a stream opened inside proot only gets 20 ms.
 - **What it costs:** the ring is primed to 40 ms before playback starts and the device buffer is at least two bursts, so expect roughly **60–70 ms** to the ear against **25–33 ms** in-process. Still well under PulseAudio's usual ~120 ms.
-- **Honest naming:** this is *DirectAudio's relay build*, not the in-process driver. The Steam **client's own** sound through the relay (`module-directaudio-sink`) is PulseAudio → sink → relay → AAudio — an *extra* hop next to a plain AAudio sink in the daemon; its only gain is sharing the device stream with the games. Hosts should default the client to their plain sink and offer the relay route as "shared output", not as DirectAudio.
+- **The Steam client's own sound** is a native Linux program's, so it can only ever reach a PulseAudio daemon; what the daemon does next is the choice. **`module-directaudio-native-sink`** *is* DirectAudio for that client: the same AAudio engine as the game driver (adaptive device buffer that grows a burst per xrun, optional decay with a remembered floor, a primed ring with fades instead of clicks, route-change / error reopen, stall watchdog, soft-knee limiter) running inside the daemon, one step from Android, with a ring that only has to cover the IO thread's own jitter (two bursts, grows if short). `module-directaudio-sink` instead feeds the relay's ring — one hop *more*, whose only gain is sharing the device stream with the games; hosts should offer it as "shared output", not as the default.
 
-Three products, released together as [`directaudio-linux-v1.0.0`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-linux-v1.0.0) and built by `.github/workflows/linux.yml`:
+Three products, released together (current: [`directaudio-linux-v1.1.0`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-linux-v1.1.0)) and built by `.github/workflows/linux.yml`:
 
 | zip | what | built in |
 |---|---|---|
 | `directaudio-linux-wine11.zip` | driver set (3 files) for Valve Proton 11.0 / Experimental / bleeding-edge / GE-Proton 11.x | ValveSoftware/wine `proton_11.0` |
 | `directaudio-linux-wine11-systhread.zip` | driver set for Proton-CachyOS (system-thread mmdevapi) | CachyOS/wine-cachyos at 11.0-20261005-slr |
 | `directaudio-linux-relay.zip` | `directaudio-relay` helper (bionic, API 28, 16 KB-page safe), also named `libdirectaudiorelay.so` | NDK r27d |
-| `directaudio-linux-sink.zip` | `module-directaudio-sink.so`, PulseAudio 13 sink for the client's own sound | NDK + PulseAudio 13 headers |
+| `directaudio-linux-sink.zip` | two PulseAudio 13 sinks for the Steam client's own sound: **`module-directaudio-native-sink.so`** (DirectAudio's engine in-process, one step from Android) and `module-directaudio-sink.so` (feeds the relay's ring: "shared output") | NDK + PulseAudio 13 headers |
 
 The helper is interface-free: one binary serves every driver set. The relay protocol (`da_relay_proto.h`, v1) is unchanged; the helper and the sink carry **the field fixes by [MaxsTechReview](https://github.com/maxjivi05) (Max)** from [Droid-Deck/DroidDeck#338](https://github.com/Droid-Deck/DroidDeck/pull/338) — prime before playing, fade on an underrun instead of clicking, one consumer per ring, a 40 ms starting target kept across reopens, a device buffer of at least two bursts, and a sink that never blocks its own thread. Those are what turned the crackle reports on 20 ms-burst devices (AYN Thor, Odin 2) around. Installation, selection in the prefix, the helper's command line and the microphone pipe are in [`docs/linux-relay/INSTALL.md`](docs/linux-relay/INSTALL.md).
 

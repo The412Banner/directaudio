@@ -11,7 +11,8 @@ Two pieces, both required:
 |---|---|---|
 | `aarch64-unix/winedirectaudio.so` + the two PE shells | the Wine `mmdevapi` driver, glibc build, **no AAudio inside** | in the game, inside the Linux rootfs |
 | `directaudio-relay` | a small bionic program that owns the AAudio output and microphone streams | on the Android side, under the app's uid |
-| `module-directaudio-sink.so` *(optional)* | a PulseAudio 13 sink that feeds the relay's ring, so the Steam client's own sound shares the device stream | in the host's PulseAudio daemon (`load-module module-directaudio-sink socket=<relay socket>`) |
+| `module-directaudio-native-sink.so` | **the Steam client's DirectAudio**: the game driver's AAudio engine as a PulseAudio 13 sink, in-process, one step from Android | in the host's PulseAudio daemon, which must run on the Android side: `load-module module-directaudio-native-sink sink_name=DirectAudio` |
+| `module-directaudio-sink.so` *(optional)* | feeds the relay's ring instead, so the client's sound shares the relay's device stream with the games ("shared output") | `load-module module-directaudio-sink socket=<relay socket>` |
 
 They meet over a unix socket. The driver connects, sends its launch config, and
 gets back two shared-memory rings: one it fills with mixed game audio, one the
@@ -181,3 +182,25 @@ the sum, so a game that sizes its own buffers from it still sees the truth.
 - The game process's `/proc/<pid>/maps` shows `winedirectaudio.so` and **no**
   `libaaudio.so` (it is in the helper's maps instead). The AudioFlinger track is
   owned by the helper's pid.
+
+## The Steam client's own sound: `module-directaudio-native-sink`
+
+Load it in the daemon's `default.pa` and make it the default sink:
+
+```
+load-module module-directaudio-native-sink sink_name=DirectAudio performance_mode=1 volume=1.0
+set-default-sink DirectAudio
+```
+
+Arguments (all optional): `buffer_ms` (device buffer to start with, default 12, never below two
+bursts), `max_ms` (growth ceiling, default 100), `ring_ms` (queue kept ahead of the device,
+default 12, never below two bursts), `adaptive=1`, `decay=0` (shrinking the device buffer after a
+quiet spell probes below what works and can click - leave it off for a client that plays menus),
+`limiter=1`, `watchdog=1`, `performance_mode` (0 none, 1 low latency, 2 power saving).
+
+The module logs what it opened, every buffer change the engine makes, a 10-second settle line and
+a 30-second underrun summary, so a session log shows what the device granted (a 20 ms burst means
+Android gave a legacy stream; the two-burst floor then makes the device buffer 40 ms).
+
+Keep a plain AAudio sink as a fallback the daemon can load if this one fails to open the stream
+(`.nofail` / `.ifexists` in `default.pa`), so the client is never left without a sink.

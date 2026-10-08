@@ -1,5 +1,25 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-10-08 — linux-v1.1.0: `module-directaudio-native-sink`, DirectAudio for the Steam client itself
+
+The relay build gave games DirectAudio; the Steam client's own sound still went PulseAudio →
+`module-directaudio-sink` → relay → AAudio, one hop MORE than a plain AAudio sink, under the name
+DirectAudio. The user asked for the client to get the real thing in the same release, not later.
+
+- **`pulse/module-directaudio-native-sink.c`** (new): the relay helper's per-client output engine
+  (`open_output` with the two-burst floor, `out_cb` with prime / fade / ring-grow / xrun-grow /
+  decay-with-floor, error-callback reopen on a fresh stream, stall watchdog) on a ring allocated in
+  the daemon's own process, fed by module-directaudio-sink's non-blocking half-burst producer; plus
+  the driver's soft-knee limiter (`DA_KNEE` 0.75) on the way out. No socket, no second process, no
+  40 ms proot margin: the ring floor is two bursts or `ring_ms` (12). Engine changes made on the
+  AAudio thread are narrated by the IO thread (no logging in the callback). `decay` defaults off.
+- `pulse/build.sh` builds both sinks and asserts the native one links libaaudio and the relay one
+  does not; `linux.yml`'s sink job ships both in `directaudio-linux-sink.zip`.
+- Hosts: run the daemon on the Android side (both apps already do), load this as the default sink,
+  keep a plain AAudio sink as a `.nofail` fallback, and offer `module-directaudio-sink` as "shared
+  output". The DroidDeck PR that takes everything from this release does exactly that.
+- Device-test owed: Pocket FIT + an AYN Thor (20 ms bursts) before the DroidDeck 0.3.2 cut.
+
 ## 2026-10-08 — v1.4.0 + directaudio-linux-v1.0.0: the relay build lands on main, a third mmdevapi ABI, DroidDeck's field fixes come home
 
 Until now the relay build lived only on `feat/linux-relay-mic` (never released), the system-thread
