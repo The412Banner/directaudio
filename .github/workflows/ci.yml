@@ -56,10 +56,12 @@ jobs:
             abi: wine11
             proton_ref: proton_11.0-cachyos-20261005
             page_flag: ""
+            ntsync: "true"   # its ntdll.so links libntsync_android (built below, as the layer does)
           - label: wine11-systhread-arm64ec-sdk35    # 16KB-page devices
             abi: wine11
             proton_ref: proton_11.0-cachyos-20261005
             page_flag: "--enable-16kb-pages"
+            ntsync: "true"
           # Wine 10.0 ABI (proton_10.0 — the tree P10-4 shipped from)
           - label: wine10-arm64ec-sdk28    # 4KB-page devices
             abi: wine10
@@ -192,6 +194,30 @@ jobs:
           key: ccache-da-${{ matrix.label }}-${{ github.sha }}
           restore-keys: |
             ccache-da-${{ matrix.label }}-
+
+      # ntsync-android by Joshua Tam (joshuatam, GameNative), LGPL-3.0-only, pinned exactly as the
+      # layer workflows pin it. The unixlib links against ntdll.so, and in the trees that carry
+      # userspace ntsync that ntdll.so links libntsync_android - so it has to exist before make.
+      - name: Check out ntsync-android (pinned 7ce6435)
+        if: matrix.ntsync == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: GameNative/ntsync-android
+          ref: 7ce6435e5979b1cb5341aa4b299f31e8937fe121
+          path: _deps/ntsync-android
+      - name: Set up Rust for ntsync-android
+        if: matrix.ntsync == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Build ntsync-android library
+        if: matrix.ntsync == 'true'
+        working-directory: wine
+        env:
+          NTSYNC_ANDROID_DIR: ${{ github.workspace }}/_deps/ntsync-android
+        run: |
+          test "$(git -C "$NTSYNC_ANDROID_DIR" rev-parse HEAD)" = 7ce6435e5979b1cb5341aa4b299f31e8937fe121
+          bash build-scripts/build-step-arm64ec.sh --build-ntsync-android
 
       - name: Build sysvshm (satisfies configure's --with-xshm requirement)
         working-directory: wine
