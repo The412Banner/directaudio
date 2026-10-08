@@ -19,7 +19,7 @@ DirectAudio game → winedirectaudio.drv → in-process mixer ──────
 
 ## Status
 
-Device-proven, shipping. Current release **v1.3.2** (adds opt-in [microphone capture](#compatibility)), built for **both Wine 10 and Wine 11** (see [Compatibility](#compatibility) and [Proton layers with DirectAudio built in](#proton-layers-with-directaudio-built-in)). Output: 48 kHz · float · stereo.
+Device-proven, shipping. Current release **v1.4.0** — built for **three Wine audio interfaces** (Wine 10, Wine 11, and Wine 11 with the *system-thread* mmdevapi that Proton-CachyOS carries; see [Compatibility](#compatibility)) — plus a separate **relay build for the Linux Steam client** (`directaudio-linux-v1.0.0`, see [below](#linux-steam-client--the-relay-build)). Output: 48 kHz · float · stereo.
 
 ---
 
@@ -106,7 +106,17 @@ This is event-level only — a handful of lines per session. Per-callback heartb
 
 ## Compatibility
 
-**Supports Wine 10 and Wine 11** — as two separate, per-Wine-major builds. The `mmdevapi` unixlib vtable is index-based, and Wine 11 inserted `midi_get_driver` at slot 30, shifting every later slot; Wine 10's `mmdevapi` has no MIDI dispatch at all. So **a single binary cannot span Proton 10 and 11** — each Wine major gets its own driver (`wine11` / `wine10`), and one `directaudio.c` compiles for both via a `WINE_MMDEVAPI_NO_MIDI_GET_DRIVER` gate (defined only on the Wine-10 base). The Wine-10 port keeps the full PE-side `mmdevdrv.c` architecture that Wine 10 requires.
+**Supports Wine 10 and Wine 11, and Wine 11's newer system-thread `mmdevapi`** — as three separate builds, because the interface is not versioned and a mismatch is silence, not an error:
+
+| build | `dlls/mmdevapi/unixlib.h` | who has it |
+|---|---|---|
+| `wine11` | `main_loop` + `timer_loop` slots, `release_stream` passes the timer thread (sha256 `fdbed263…`) | Valve Proton 11.0 / Experimental / bleeding-edge, GE-Proton 11.x, our bionic 11.0-x layers |
+| `wine11-systhread` | upstream Wine's "use a system thread for the driver loops": `main_loop_start/stop`, **no** `timer_loop`, driver owns its timer thread via `create_unix_thread` (sha256 `0de9fde4…`) | **Proton-CachyOS** 11.0-20260703 / 20261005 (wine-cachyos), our CachyOS layers |
+| `wine10` | no MIDI dispatch, PE-side `mmdevdrv.c` (sha256 `1dee03c1…`) | Proton 10.0-4, GE-Proton 10.0-34 |
+
+The quickest field test, with only a built Proton to hand: `nm -D --undefined-only lib/wine/aarch64-unix/winepulse.so | grep -c PsCreateSystemThread` — `1` is system-thread, `0` is the classic table. The `wine11` ↔ `wine11-systhread` split is `#ifdef WINE_MMDEVAPI_SYSTEM_THREADS` in one `directaudio.c`; the proton-wine trees that carry the newer mmdevapi define it in `configure.ac`.
+
+The Wine 10 ↔ 11 split:  The `mmdevapi` unixlib vtable is index-based, and Wine 11 inserted `midi_get_driver` at slot 30, shifting every later slot; Wine 10's `mmdevapi` has no MIDI dispatch at all. So **a single binary cannot span Proton 10 and 11** — each Wine major gets its own driver (`wine11` / `wine10`), and one `directaudio.c` compiles for both via a `WINE_MMDEVAPI_NO_MIDI_GET_DRIVER` gate (defined only on the Wine-10 base). The Wine-10 port keeps the full PE-side `mmdevdrv.c` architecture that Wine 10 requires.
 
 *Within* Wine 11, every point release is ABI-compatible: **one Wine-11 build serves every 11.0-x layer** (Proton 11.0-1 / 11.0-2, GE-Proton 11.0-3 / 11.0-5 / 11.0-6) — device-verified by hot-swapping a single driver across them (including the 32-bit PE, in a 32-bit game). The same holds within Wine 10 (Proton 10.0-4, GE-Proton 10.0-34). Only the Wine 10 ↔ 11 boundary needs a separate build.
 
@@ -134,12 +144,12 @@ This is event-level only — a handful of lines per session. Per-callback heartb
 | **GE-Proton 10.0-34** | 10 | `wine10` |
 | **Proton 10.0-4** | 10 | `wine10` |
 
-All seven are published together as one consolidated proton-wine release:
+The two **Proton-CachyOS** layers (11.0-20260703, 11.0-20261005) carry the `wine11-systhread` build. All are published together as consolidated proton-wine releases (current: [bionic layers v14](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20261007-v14)):
 
 - **Current stable — DirectAudio v1.3.1:** [`build-bionic-layers-20260830-fontcap`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260830-fontcap)
 - **Pre-release, DirectAudio v1.3.2** (unified true-SDK28 + 16 KB-aligned rebuild — CI-green and binary-verified, **not** device-boot-proven): [`build-bionic-layers-20260901-sdk28-16kb-da132`](https://github.com/The412Banner/proton-wine/releases/tag/build-bionic-layers-20260901-sdk28-16kb-da132)
 
-Standalone **complete-driver zips** (both ABIs × both page sizes, each the full 3-file set) are attached to the [`directaudio-v1.3.2`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-v1.3.2) release for manual / hot-swap use — that is the fastest way to put v1.3.2 on a layer that still carries v1.3.1.
+Standalone **complete-driver zips** (three ABIs × both page sizes, each the full 3-file set) are attached to the [`directaudio-v1.4.0`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-v1.4.0) release for manual / hot-swap use.
 
 ### Configuration
 
@@ -279,15 +289,26 @@ cannot, so check the open log for what you actually got.
 
 ## Linux Steam client — the relay build
 
-The one place the in-process route is **impossible**: a game running under **Valve's ARM64 Proton inside a Linux runtime on Android** (Bannerlator's linuxfs session with the native Steam client). That game process is a glibc process in a proot'd rootfs; it cannot load bionic's `libaaudio` at all, and the session gives it no way to spawn an Android process. So for that runtime there is a second build of this same source, **`-DDA_RELAY`**, where every AAudio call moves into a small helper on the Android side:
+The native Linux Steam client on Android (DroidDeck, Bannerlator's Linux session) runs games on **glibc** Protons — Valve's ARM64 Proton, GE-Proton, Proton-CachyOS — inside a proot runtime that binds no `/system`. A game there **cannot call AAudio at all**, so the in-process design above is impossible, and one hop is unavoidable. The relay build makes it the smallest hop there is:
 
 ```
-game (WASAPI) → winedirectaudio.so (glibc, mixer) ──memfd ring──► directaudio-relay (bionic) → AAudio → 🔊
-                                                  ◄──memfd ring──  (owns the OUTPUT + mic INPUT streams)
-                                                  ──unix socket──  (one handshake, mic start/stop)
+game (guest WASAPI) → winedirectaudio.so (glibc, mixes in-process) ──memfd ring + futex──► directaudio-relay (bionic, outside proot) → AAudio → 🔊
 ```
 
-The mixer, the adaptive buffering, decay, self-healing, the live-config mailbox and **microphone capture** all carry over — the AAudio-facing half runs in the helper instead of the game, and the two share lock-free rings with a futex wake so nothing polls. The price is one extra hand-off, about two bursts (≈8 ms on a 192-frame device), on top of what the in-process build pays; `get_latency` reports it honestly. It is built by [`linux.yml`](.github/workflows/linux.yml) inside Valve's own `proton_11.0` tree (its `mmdevapi` ABI is identical to Proton Experimental's and to our Wine-11 layers), gated so the game-side library can never mention AAudio. Install and proof-of-life: [`docs/linux-relay/INSTALL.md`](docs/linux-relay/INSTALL.md).
+- **What stays direct:** every voice is still mixed, converted and resampled **inside the game's driver**; what crosses to the helper is finished 48 kHz float stereo in a shared-memory ring, woken by a futex — no PulseAudio protocol, no daemon in the game's path. The helper owns the one AAudio output stream (and the microphone) with the driver's own adaptive / self-healing logic, and because it runs **outside** proot it gets Android's 4 ms bursts where a stream opened inside proot only gets 20 ms.
+- **What it costs:** the ring is primed to 40 ms before playback starts and the device buffer is at least two bursts, so expect roughly **60–70 ms** to the ear against **25–33 ms** in-process. Still well under PulseAudio's usual ~120 ms.
+- **Honest naming:** this is *DirectAudio's relay build*, not the in-process driver. The Steam **client's own** sound through the relay (`module-directaudio-sink`) is PulseAudio → sink → relay → AAudio — an *extra* hop next to a plain AAudio sink in the daemon; its only gain is sharing the device stream with the games. Hosts should default the client to their plain sink and offer the relay route as "shared output", not as DirectAudio.
+
+Three products, released together as [`directaudio-linux-v1.0.0`](https://github.com/The412Banner/directaudio/releases/tag/directaudio-linux-v1.0.0) and built by `.github/workflows/linux.yml`:
+
+| zip | what | built in |
+|---|---|---|
+| `directaudio-linux-wine11.zip` | driver set (3 files) for Valve Proton 11.0 / Experimental / bleeding-edge / GE-Proton 11.x | ValveSoftware/wine `proton_11.0` |
+| `directaudio-linux-wine11-systhread.zip` | driver set for Proton-CachyOS (system-thread mmdevapi) | CachyOS/wine-cachyos at 11.0-20261005-slr |
+| `directaudio-linux-relay.zip` | `directaudio-relay` helper (bionic, API 28, 16 KB-page safe), also named `libdirectaudiorelay.so` | NDK r27d |
+| `directaudio-linux-sink.zip` | `module-directaudio-sink.so`, PulseAudio 13 sink for the client's own sound | NDK + PulseAudio 13 headers |
+
+The helper is interface-free: one binary serves every driver set. The relay protocol (`da_relay_proto.h`, v1) and the helper carry the fixes DroidDeck made in the field (prime before playing, fade on an underrun instead of clicking, one consumer per ring, 40 ms starting target, a device buffer of at least two bursts). Installation, selection in the prefix, the helper's command line and the microphone pipe are in [`docs/linux-relay/INSTALL.md`](docs/linux-relay/INSTALL.md).
 
 ## Roadmap
 

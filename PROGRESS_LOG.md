@@ -1,5 +1,41 @@
 # DirectAudio — Progress Log / Checkpoint
 
+## 2026-10-08 — v1.4.0 + directaudio-linux-v1.0.0: the relay build lands on main, a third mmdevapi ABI, DroidDeck's field fixes come home
+
+Until now the relay build lived only on `feat/linux-relay-mic` (never released), the system-thread
+ABI port only on `feat/wine11-systhread-abi` (used inside the CachyOS bionic layers, never released),
+and DroidDeck had vendored the relay helper and fixed it on its own (PR Droid-Deck/DroidDeck#338 by
+MaxsTechReview: prime before playing, fade on an underrun instead of clicking, one consumer per
+ring, 40 ms starting target that survives reopens, a device buffer of at least two bursts). The
+Steam-client sink module existed only in DroidDeck. Three apps, three copies.
+
+- **Merged:** `feat/linux-relay-mic` (7 commits, fast-forward) and `feat/wine11-systhread-abi`
+  (clean merge; `#ifdef WINE_MMDEVAPI_SYSTEM_THREADS` in `directaudio.c`).
+- **`directaudio-relay.c`** = DroidDeck's `tools/directaudio-relay/directaudio-relay.c` as of
+  org main `679948e` (their e4727e9 import + the #338 fixes), taken whole.
+- **`pulse/module-directaudio-sink.c`** (+ `config.h`, `ltdl.h`, `build.sh`): DroidDeck's post-#338
+  sink (half-burst poll timer instead of a futex wait, IO thread at nice -16, `MIN_AHEAD_MS` 40,
+  `buffer_ms` 24). `da_relay_proto.h` is byte-identical in all three places; protocol stays v1.
+- **The CachyOS silence gap, found today:** both DroidDeck CachyOS tags (`cachyos-11.0-20260703-slr`
+  and `-20261005-slr`) carry wine-cachyos with the system-thread `mmdevapi/unixlib.h`
+  (sha256 `0de9fde4…`), not Valve's `fdbed263…` the relay driver was built against. DroidDeck's
+  launch gate only checks `wine --version` major == 11, so CachyOS passed and loaded a driver with
+  the wrong call table → silence. Not device-tested yet; the headers are unambiguous.
+- **CI:** `ci.yml` is now 3×2 (`wine11`, `wine11-systhread` via `proton_11.0-cachyos-20261005`,
+  `wine10`) → 6 bionic zips on `directaudio-v*`. `linux.yml` is a matrix (`linux-wine11` in
+  ValveSoftware/wine `proton_11.0`, `linux-wine11-systhread` in CachyOS/wine-cachyos `2ce6b44caa6`
+  with `-DWINE_MMDEVAPI_SYSTEM_THREADS`), each leg refusing a tree whose `unixlib.h` does not hash
+  to its claimed table and asserting the `PsCreateSystemThread` import presence/absence in the
+  built `.so`; plus the relay job and a new `sink` job (PulseAudio 13 headers, DroidDeck's
+  `libpulse*` to link) → 4 zips + `SHA256SUMS.txt` on `directaudio-linux-v*`.
+- **Honesty note for hosts (README):** the relay is DirectAudio's smallest-possible hop for a game
+  that cannot touch AAudio; the Steam *client's* sound through the relay is one hop MORE than a
+  plain AAudio sink — hosts should default the client to their own sink and call the relay route
+  "shared output".
+- **Not done here:** the host-side ABI check (DroidDeck `steam-compatibility`, Bannerlator's Linux
+  session) that picks the set by `winepulse.so`'s `PsCreateSystemThread` import; a `linux-wine10`
+  leg (nothing uses it); the Bluetooth / route-change rate re-derive (still open, roadmap).
+
 ## 2026-09-20 — helper: `--mic-fifo`, a microphone for the Steam client itself (branch `feat/linux-relay-mic`)
 
 Requested via the Linux-runtime session with the user's approval. The relay gives a **game** a mic

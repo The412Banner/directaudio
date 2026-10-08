@@ -11,20 +11,36 @@ Two pieces, both required:
 |---|---|---|
 | `aarch64-unix/winedirectaudio.so` + the two PE shells | the Wine `mmdevapi` driver, glibc build, **no AAudio inside** | in the game, inside the Linux rootfs |
 | `directaudio-relay` | a small bionic program that owns the AAudio output and microphone streams | on the Android side, under the app's uid |
+| `module-directaudio-sink.so` *(optional)* | a PulseAudio 13 sink that feeds the relay's ring, so the Steam client's own sound shares the device stream | in the host's PulseAudio daemon (`load-module module-directaudio-sink socket=<relay socket>`) |
 
 They meet over a unix socket. The driver connects, sends its launch config, and
 gets back two shared-memory rings: one it fills with mixed game audio, one the
 helper fills with microphone audio. The helper plays and records; the driver
 keeps doing everything else it always did.
 
-## Which Proton
+## Which Proton — pick the set by its audio interface
 
-Built inside `ValveSoftware/wine` at `proton_11.0`. The private `mmdevapi`
-interface it implements is byte-identical across **Proton 11.0 (ARM64)**,
-**Proton Experimental (ARM64)** and our own Wine-11 layers (checked 2026-09-19),
-so this one build serves any of them. A future Proton on a Wine 12 base will
-need a rebuild - the interface is not versioned, and a mismatch is silence, not
-an error.
+The private `mmdevapi` interface between Wine and this driver is **not versioned**: a
+set built for one table loaded into a Wine with the other produces **silence, not an
+error**. Two sets ship:
+
+| set | interface | Protons |
+|---|---|---|
+| `linux-wine11` | classic Wine 11 (`main_loop` + `timer_loop`) — built in ValveSoftware/wine `proton_11.0` | Proton 11.0 (ARM64), Proton Experimental (ARM64), bleeding-edge, GE-Proton 11.x |
+| `linux-wine11-systhread` | system-thread mmdevapi (`main_loop_start/stop`, no `timer_loop`) — built in CachyOS/wine-cachyos at 11.0-20261005-slr | Proton-CachyOS 11.0-20260703-slr, 11.0-20261005-slr |
+
+**Do not pick by the Wine version string** — both tables say `wine-11.0`. Pick by the
+Proton's own files, once, at launch:
+
+```sh
+# 1 = system-thread set, 0 = classic set
+nm -D --undefined-only "$PROTON/files/lib/wine/aarch64-unix/winepulse.so" | grep -c PsCreateSystemThread
+```
+
+(or `sha256sum dlls/mmdevapi/unixlib.h` when the source is to hand: `fdbed263…` classic,
+`0de9fde4…` system-thread; each set's `version.txt` names the hash it was built against).
+No match (Proton 10, a future Wine 12) → leave DirectAudio off and let Proton's own audio
+run, rather than guess.
 
 ## Installing the driver next to Proton (not into it)
 

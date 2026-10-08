@@ -1,16 +1,28 @@
 name: build driver (Linux Steam client relay)
 
-# The DirectAudio driver for a glibc Wine: Valve's own ARM64 Proton as the
-# Linux Steam client runs it on Android (Bannerlator's linuxfs runtime). Two
-# products, built by two jobs:
+# The DirectAudio driver for a glibc Wine: Valve's own ARM64 Proton (and the
+# GE / CachyOS builds of it) as the Linux Steam client runs it on Android inside
+# a proot runtime (DroidDeck, Bannerlator's Linux session). Three products:
 #
 #   unixlib  winedirectaudio.so (aarch64 glibc, -DDA_RELAY: NO AAudio) plus the
-#            arm64ec + i386 PE shells, built inside ValveSoftware/wine at the
-#            proton_11.0 branch, whose dlls/mmdevapi/unixlib.h is byte-identical
-#            to experimental_11.0 and to our ge-proton11-bionic (checked
-#            2026-09-19), so one build serves both ARM64 depots.
+#            arm64ec + i386 PE shells - ONE SET PER mmdevapi ABI, because the
+#            private dlls/mmdevapi/unixlib.h call table is not versioned and a
+#            mismatch is silence, not an error:
+#              linux-wine11            ValveSoftware/wine @ proton_11.0 - serves
+#                                      Proton 11.0, Proton Experimental,
+#                                      bleeding-edge and GE-Proton 11.x (their
+#                                      unixlib.h is byte-identical, checked
+#                                      2026-10-08)
+#              linux-wine11-systhread  CachyOS/wine-cachyos at the commit of
+#                                      proton-cachyos 11.0-20261005-slr: upstream
+#                                      Wine's system-thread mmdevapi
+#                                      (main_loop_start/stop, no timer_loop) -
+#                                      also what 11.0-20260703-slr carries
 #   relay    directaudio-relay (aarch64 bionic, API 28, 16 KB-page safe): the
-#            helper that owns every AAudio stream on the Android side.
+#            helper that owns every AAudio stream on the Android side, ABI-free.
+#   sink     module-directaudio-sink.so: a PulseAudio 13 sink that feeds the
+#            relay's ring, so the Steam client's own sound shares the device
+#            stream with the games.
 #
 # The unixlib is CROSS-compiled from x86_64 exactly the way the bionic build is:
 # native wine-tools first, then a --host=aarch64-linux-gnu configure of the same
@@ -29,24 +41,41 @@ on:
   workflow_dispatch:
 
 env:
-  WINE_REPO: ValveSoftware/wine
-  WINE_REF: proton_11.0
   LLVM_MINGW: llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+  # The two mmdevapi call tables this build knows. The checkout is refused when a
+  # tree's header does not hash to the table its leg claims, so a silent mismatch
+  # can never ship under a known label.
+  UNIXLIB_SHA_WINE11: fdbed263338d0719c4d12e02b045c23721de33219ec8878e4c2d7ebc9efcbe09
+  UNIXLIB_SHA_SYSTHREAD: 0de9fde40d091d82
 
 jobs:
   unixlib:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-wine11
+            abi: wine11
+            wine_repo: ValveSoftware/wine
+            wine_ref: proton_11.0
+            extradefs: ""
+          - label: linux-wine11-systhread
+            abi: systhread
+            wine_repo: CachyOS/wine-cachyos
+            wine_ref: 2ce6b44caa66a56ec99c7826ae564c088abc1b9f
+            extradefs: "-DWINE_MMDEVAPI_SYSTEM_THREADS"
     steps:
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h | head -2
 
-      - name: Checkout Valve's Wine tree (${{ env.WINE_REF }})
+      - name: Checkout the Wine tree (${{ matrix.wine_repo }} @ ${{ matrix.wine_ref }})
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.WINE_REPO }}
-          ref: ${{ env.WINE_REF }}
+          repository: ${{ matrix.wine_repo }}
+          ref: ${{ matrix.wine_ref }}
           path: wine
           fetch-depth: 1
 
@@ -61,15 +90,30 @@ jobs:
           mkdir -p wine/dlls/winedirectaudio.drv
           cp -v driver/directaudio.c driver/da_relay_proto.h driver/da_aaudio_compat.h wine/dlls/winedirectaudio.drv/
           cp -v driver/Makefile.relay.in wine/dlls/winedirectaudio.drv/Makefile.in
-          # Register the module with configure. Valve's tree has no directaudio
-          # integration (it is upstream Wine plus Proton); the only line the
-          # relay build needs is the makefile registration - no AAudio probe, no
-          # mmdevapi driver-list change (the driver is selected by registry).
+          if [ -n "${{ matrix.extradefs }}" ]; then
+            sed -i 's|^EXTRADEFS = -DDA_RELAY$|EXTRADEFS = -DDA_RELAY ${{ matrix.extradefs }}|' wine/dlls/winedirectaudio.drv/Makefile.in
+          fi
+          grep -n '^EXTRADEFS' wine/dlls/winedirectaudio.drv/Makefile.in
+          # Register the module with configure. These trees have no directaudio
+          # integration (upstream Wine plus Proton); the only line the relay build
+          # needs is the makefile registration - no AAudio probe, no mmdevapi
+          # driver-list change (the driver is selected by registry).
           grep -q 'WINE_CONFIG_MAKEFILE(dlls/winedirectaudio.drv)' wine/configure.ac || \
             sed -i 's|^WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)$|WINE_CONFIG_MAKEFILE(dlls/winedirectaudio.drv)\nWINE_CONFIG_MAKEFILE(dlls/winepulse.drv)|' wine/configure.ac
           grep -n 'winedirectaudio' wine/configure.ac
           echo "--- ABI header this build compiles against ---"
           sha256sum wine/dlls/mmdevapi/unixlib.h
+          SHA=$(sha256sum wine/dlls/mmdevapi/unixlib.h | cut -c1-64)
+          case "${{ matrix.abi }}" in
+            wine11)
+              test "$SHA" = "$UNIXLIB_SHA_WINE11"
+              grep -q 'struct timer_loop_params' wine/dlls/mmdevapi/unixlib.h ;;
+            systhread)
+              test "${SHA:0:16}" = "$UNIXLIB_SHA_SYSTHREAD"
+              grep -q 'create_unix_thread' wine/dlls/mmdevapi/unixlib.h
+              ! grep -q 'struct timer_loop_params' wine/dlls/mmdevapi/unixlib.h ;;
+          esac
+          echo "OK: ${{ matrix.label }} is the ${{ matrix.abi }} mmdevapi table"
           ls -la wine/dlls/winedirectaudio.drv/
 
       - name: Set up build environment
@@ -97,13 +141,13 @@ jobs:
         working-directory: wine
         run: |
           set -e
-          # Valve's tree does not commit make_vulkan's output (include/wine/vulkan.h,
+          # Valve-derived trees do not commit make_vulkan's output (include/wine/vulkan.h,
           # the winevulkan thunks); makedep then refuses to generate any Makefile.
           # Proton's own build runs exactly this first (make/rules-wine.mk).
           python3 dlls/winevulkan/make_vulkan -x vk.xml -X video.xml
           tools/make_specfiles || true
           # The committed include/wine/server_protocol.h lags server/protocol.def
-          # in Valve's tree (Proton regenerates it); the unixlib links against
+          # in these trees (Proton regenerates it); the unixlib links against
           # ntdll.so, whose build needs the two to agree.
           tools/make_requests
           test -f include/wine/vulkan.h
@@ -114,7 +158,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: wine/wine-tools
-          key: wine-tools-linux-${{ env.WINE_REF }}-${{ hashFiles('wine/configure.ac') }}
+          key: wine-tools-linux-${{ matrix.label }}-${{ hashFiles('wine/configure.ac') }}
       - name: Build wine-tools (native)
         if: steps.cache-wine-tools.outputs.cache-hit != 'true'
         working-directory: wine
@@ -131,9 +175,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-da-linux-${{ github.sha }}
+          key: ccache-da-${{ matrix.label }}-${{ github.sha }}
           restore-keys: |
-            ccache-da-linux-
+            ccache-da-${{ matrix.label }}-
 
       - name: Configure (aarch64 glibc unix side, llvm-mingw PE side)
         working-directory: wine
@@ -186,7 +230,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          OUT="$GITHUB_WORKSPACE/out/linux-wine11"
+          OUT="$GITHUB_WORKSPACE/out/${{ matrix.label }}"
           mkdir -p "$OUT/aarch64-windows" "$OUT/i386-windows" "$OUT/aarch64-unix"
           PE64=$(find . -type f -path '*/aarch64-windows/winedirectaudio.drv' | head -1)
           PE32=$(find . -type f -path '*/i386-windows/winedirectaudio.drv'    | head -1)
@@ -209,16 +253,25 @@ jobs:
           ! aarch64-linux-gnu-nm -D -u "$OUT/aarch64-unix/winedirectaudio.so" | grep -qi 'aaudio'
           ! grep -aq 'libaaudio' "$OUT/aarch64-unix/winedirectaudio.so"
           echo "OK: glibc unixlib, AAudio-free"
+          if [ "${{ matrix.abi }}" = "systhread" ]; then
+            # The system-thread table makes the driver spawn its own timer thread.
+            aarch64-linux-gnu-nm -D -u "$OUT/aarch64-unix/winedirectaudio.so" | grep -q 'PsCreateSystemThread'
+            echo "OK: system-thread build (imports PsCreateSystemThread)"
+          else
+            ! aarch64-linux-gnu-nm -D -u "$OUT/aarch64-unix/winedirectaudio.so" | grep -q 'PsCreateSystemThread'
+            echo "OK: classic Wine 11 build (no PsCreateSystemThread)"
+          fi
           cp -v "$GITHUB_WORKSPACE/driver/docs/linux-relay/INSTALL.md" "$OUT/README.md" 2>/dev/null || true
-          printf 'directaudio linux-wine11 relay build\nsource %s\nwine %s@%s\nunixlib.h sha256 %s\n' \
-            "${{ github.sha }}" "${{ env.WINE_REPO }}" "${{ env.WINE_REF }}" \
+          printf 'directaudio %s relay build\nabi %s\nsource %s\nwine %s@%s\nunixlib.h sha256 %s\n' \
+            "${{ matrix.label }}" "${{ matrix.abi }}" "${{ github.sha }}" "${{ matrix.wine_repo }}" "${{ matrix.wine_ref }}" \
             "$(sha256sum dlls/mmdevapi/unixlib.h | cut -c1-64)" > "$OUT/version.txt"
+          cat "$OUT/version.txt"
 
       - name: Upload unixlib artifact
         uses: actions/upload-artifact@v4
         with:
-          name: directaudio-linux-wine11
-          path: out/linux-wine11
+          name: directaudio-${{ matrix.label }}
+          path: out/${{ matrix.label }}
           retention-days: 30
 
   relay:
@@ -250,10 +303,12 @@ jobs:
           mkdir -p "$OUT"
           # One binary for every device: API 28 is the driver's floor, and a
           # 16 KB max-page-size executable loads on 4 KB and 16 KB kernels alike.
-          "$TC/aarch64-linux-android28-clang" -O2 -Wall -Wextra -Wno-unused-parameter \
+          "$TC/aarch64-linux-android28-clang" -O2 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
             -fPIE -pie -Wl,-z,max-page-size=16384 -Wl,-z,now \
             directaudio-relay.c -o "$OUT/directaudio-relay" -laaudio -llog -pthread
           "$TC/llvm-strip" --strip-all "$OUT/directaudio-relay"
+          # The same binary under the name an Android app's jniLibs/ wants.
+          cp "$OUT/directaudio-relay" "$OUT/libdirectaudiorelay.so"
           ls -la "$OUT"; file "$OUT/directaudio-relay"
           echo "--- helper linkage (MUST carry libaaudio: it is the whole point) ---"
           "$TC/llvm-readelf" -d "$OUT/directaudio-relay" | grep -E 'NEEDED'
@@ -270,8 +325,44 @@ jobs:
           path: out/relay
           retention-days: 30
 
+  sink:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout this driver
+        uses: actions/checkout@v4
+
+      - name: PulseAudio 13.0 source (headers only)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o pa.tar.gz https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v13.0.tar.gz
+          mkdir -p pa13 && tar -xzf pa.tar.gz -C pa13 --strip-components=1 && rm pa.tar.gz
+
+      - name: The daemon libraries the module links against (DroidDeck's PulseAudio 13 bundle, arm64)
+        run: |
+          set -euo pipefail
+          mkdir -p palibs
+          for lib in libpulsecore-13.0.so libpulsecommon-13.0.so libpulse.so; do
+            curl -fsSL -o "palibs/$lib" "https://raw.githubusercontent.com/Droid-Deck/DroidDeck/main/app/src/main/jniLibs/arm64-v8a/$lib"
+          done
+          ls -la palibs; file palibs/*
+
+      - name: Build module-directaudio-sink.so
+        run: |
+          set -euo pipefail
+          export NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          pulse/build.sh "$PWD/pa13" "$PWD/palibs" "$PWD/out/sink"
+          printf 'module-directaudio-sink (PulseAudio 13, Android arm64)\nsource %s\nprotocol v%s\n' "${{ github.sha }}" \
+            "$(grep -oE '#define DA_RELAY_VERSION +[0-9]+' da_relay_proto.h | grep -oE '[0-9]+$')" > out/sink/version.txt
+
+      - name: Upload sink artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: directaudio-linux-sink
+          path: out/sink
+          retention-days: 30
+
   release:
-    needs: [ unixlib, relay ]
+    needs: [ unixlib, relay, sink ]
     if: startsWith(github.ref, 'refs/tags/directaudio-linux-v')
     runs-on: ubuntu-24.04
     permissions:
@@ -289,19 +380,21 @@ jobs:
             n=$(basename "$d")
             (cd "$d" && zip -qr "$GITHUB_WORKSPACE/release/${n}.zip" .)
           done
+          (cd release && sha256sum *.zip > SHA256SUMS.txt)
           ls -la release
       - name: Attach to release
         uses: softprops/action-gh-release@v1
         with:
           files: release/*
           body: |
-            **DirectAudio for the Linux Steam client** - the relay build.
-            - `directaudio-linux-wine11.zip` - the driver for Valve's ARM64 Proton (Proton 11.0 and
-              Proton Experimental, both Wine 11 ABI). Complete 3-file set laid out for `lib/wine/`:
-              `aarch64-windows/` + `i386-windows/` PE shells, `aarch64-unix/winedirectaudio.so`
-              (glibc, AAudio-free - it talks to the helper).
-            - `directaudio-linux-relay.zip` - `directaudio-relay`, the Android-side helper that
-              owns the AAudio output and microphone streams. Run it under the app's uid, on the
-              socket the driver is pointed at with `BANNER_AUDIO_DIRECT_RELAY`.
+            **DirectAudio for the Linux Steam client** - the relay build (DroidDeck, Bannerlator's Linux session).
+
+            One driver set per Wine audio interface - **pick by the Proton's `dlls/mmdevapi/unixlib.h`, not by its version number**; a mismatch is silence, not an error:
+            - `directaudio-linux-wine11.zip` - Valve **Proton 11.0**, **Proton Experimental**, bleeding-edge and **GE-Proton 11.x** (ValveSoftware/wine `proton_11.0`). Complete 3-file set laid out for `lib/wine/`.
+            - `directaudio-linux-wine11-systhread.zip` - **Proton-CachyOS** 11.0-20260703 / 20261005 and any Wine with the system-thread mmdevapi (`main_loop_start`, no `timer_loop`). Same layout.
+            - `directaudio-linux-relay.zip` - `directaudio-relay` (also as `libdirectaudiorelay.so`), the Android-side helper that owns the AAudio output and microphone streams. One binary for every set.
+            - `directaudio-linux-sink.zip` - `module-directaudio-sink.so`, the PulseAudio 13 sink that lets the Steam client's own sound share the relay's stream.
+
+            Quick test for which set a Proton needs: `nm -D --undefined-only files/lib/wine/aarch64-unix/winepulse.so | grep -c PsCreateSystemThread` - `1` means system-thread, `0` means plain Wine 11.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
