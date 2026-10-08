@@ -117,13 +117,15 @@ jobs:
           # the pinned proton-wine ref; nothing to patch here.
 
       - name: Set up build environment
+        # libwayland-bin: wayland-scanner, which the trees that build winewayland.drv
+        # (proton_10.0, the CachyOS branches) look for at configure time.
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y \
             build-essential git wget curl unzip flex bison gettext \
             autoconf automake libtool pkg-config mingw-w64 \
-            gcc-multilib g++-multilib ccache \
+            gcc-multilib g++-multilib ccache libwayland-bin \
             libfreetype6-dev libfreetype6-dev:i386 \
             libpng-dev libpng-dev:i386 zlib1g-dev zlib1g-dev:i386
 
