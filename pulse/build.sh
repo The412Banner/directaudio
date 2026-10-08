@@ -7,7 +7,7 @@
 #                                      output")
 # Compiled against the upstream PulseAudio 13.0 source headers and linked against the daemon
 # libraries the host app ships (libpulsecore-13.0 / libpulsecommon-13.0 / libpulse, Android
-# arm64), with the Android NDK (API 26 = AAudio's floor).
+# arm64), with the Android NDK (API 28, the same floor as the driver and the relay).
 #
 #   NDK=<ndk root> pulse/build.sh <pulseaudio-13.0 source dir> <dir with the three libpulse*.so> <output dir>
 set -euo pipefail
@@ -16,7 +16,9 @@ LIBS=$2
 OUTDIR=$3
 mkdir -p "$OUTDIR"
 : "${NDK:?set NDK to the Android NDK root}"
-API=26
+# API 28: the driver's and the relay's floor too (AAudioStreamBuilder_setUsage is 28+), and the
+# daemon these modules load into runs in the same app on the same device.
+API=28
 HERE=$(cd "$(dirname "$0")" && pwd)
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) NDK_HOST=darwin-arm64 ;;
